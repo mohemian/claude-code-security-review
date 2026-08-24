@@ -205,8 +205,10 @@ At the end of every run the action writes a table to the GitHub Actions **job su
 | Findings after filtering | **3** |
 | Findings excluded | 0 |
 
-The same figures are in the results JSON under `run_stats`, so they can be consumed by
-later workflow steps.
+The same figures are in the results JSON under `run_stats`, and the rendered table is
+written to `security-review-summary.md` in the workspace (and uploaded with the other
+artifacts), so later workflow steps can read it. `GITHUB_STEP_SUMMARY` is per-step and
+cannot be read back, which is why the file exists.
 
 Cost shows **not reported** rather than `$0.00` for providers that do not price their
 calls — a self-hosted vLLM has no per-call cost, and printing zero would be a claim rather

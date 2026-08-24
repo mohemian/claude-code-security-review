@@ -79,22 +79,25 @@ jobs:
       - name: Check the run summary table was written
         if: always()
         run: |
-          echo "::group::job summary as written"
-          cat "$GITHUB_STEP_SUMMARY"
+          # GITHUB_STEP_SUMMARY is per-step and cannot be read back from here, so the
+          # action also writes the rendered table to the workspace.
+          SUMMARY="${{ github.workspace }}/security-review-summary.md"
+          echo "::group::rendered summary"
+          cat "$SUMMARY"
           echo "::endgroup::"
           for row in "| Provider | \`spark\`" "| Model | \`Qwen3-smoke-test\`" \
                      "| LLM calls |" "| Input tokens |" "| Findings after filtering |"; do
-            if ! grep -qF "$row" "$GITHUB_STEP_SUMMARY"; then
+            if ! grep -qF "$row" "$SUMMARY"; then
               echo "::error::run summary is missing the row: $row"
               exit 1
             fi
           done
           # Zeroes here would mean usage was never threaded through from the provider.
-          if grep -qE "^\| (Input|Output|Total) tokens \| (0|n/a) \|$" "$GITHUB_STEP_SUMMARY"; then
+          if grep -qE "^\| (Input|Output|Total) tokens \| (0|n/a) \|$" "$SUMMARY"; then
             echo "::error::token counts are zero or missing; usage did not reach the summary"
             exit 1
           fi
-          if grep -qF "| Cost | \$0" "$GITHUB_STEP_SUMMARY"; then
+          if grep -qF "| Cost | \$0" "$SUMMARY"; then
             echo "::error::a local vLLM has no per-call cost; it must read 'not reported'"
             exit 1
           fi

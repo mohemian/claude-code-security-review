@@ -408,22 +408,24 @@ runs:
         FINDINGS_COUNT: ${{ steps.claudecode-scan.outputs.findings_count }}
       run: |
         RESULTS="${{ github.workspace }}/claudecode-results.json"
+        SUMMARY="${{ github.workspace }}/security-review-summary.md"
+
+        # Written to a file first, then appended to the step summary. GITHUB_STEP_SUMMARY
+        # is per-step, so a file is also the only way later steps and the artifact upload
+        # can see what was rendered.
         {
           echo "## Security review"
           echo
           if [ ! -s "$RESULTS" ]; then
             echo "The scan produced no results file."
-            exit 0
-          fi
-          if jq -e '.error' "$RESULTS" >/dev/null 2>&1; then
+          elif jq -e '.error' "$RESULTS" >/dev/null 2>&1; then
             echo "The scan did not complete:"
             echo
             echo '```'
             jq -r '.error' "$RESULTS"
             echo '```'
-            exit 0
-          fi
-          jq -r '
+          else
+            jq -r '
             def n: if . == null then "n/a" else (. | tostring) end;
             def commas: if . == null then "n/a" else
               (tostring | explode | reverse | to_entries
@@ -450,7 +452,11 @@ runs:
             "| Findings after filtering | **\($s.findings.kept | n)** |",
             "| Findings excluded | \($s.findings.excluded | n) |"
           ' "$RESULTS" 2>/dev/null || echo "Run statistics were not available."
-        } >> "$GITHUB_STEP_SUMMARY"
+          fi
+        } > "$SUMMARY"
+
+        cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+        cat "$SUMMARY"
 
     - name: Upload scan results
       if: always() && inputs.upload-results == 'true'
@@ -461,6 +467,7 @@ runs:
           findings.json
           claudecode-results.json
           claudecode-error.log
+          security-review-summary.md
         retention-days: 7
         if-no-files-found: ignore
     
