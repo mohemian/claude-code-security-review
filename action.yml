@@ -86,7 +86,7 @@ runs:
         echo "::group::Install gh CLI"
         # Install GitHub CLI for PR operations (self-hosted runners often ship it already)
         if command -v gh >/dev/null 2>&1; then
-          echo "gh is already installed: $(gh --version | head -n1)"
+          echo "gh is already installed: $(gh --version 2>/dev/null | head -n1 || true)"
         else
           sudo apt-get update && sudo apt-get install -y gh
         fi
@@ -191,6 +191,13 @@ runs:
         LLM_PROVIDER: ${{ inputs.provider }}
       run: |
         echo "::group::Install Deps"
+        case "$LLM_PROVIDER" in
+          ""|anthropic|spark) ;;
+          *)
+            echo "::error::Unsupported provider: '$LLM_PROVIDER'. Supported providers: anthropic, spark"
+            exit 1
+            ;;
+        esac
         if [ "${{ steps.claudecode-check.outputs.enable_claudecode }}" == "true" ]; then
           pip install -r "$ACTION_PATH/claudecode/requirements.txt"
           # Claude Code and the Anthropic SDK are only needed by the anthropic provider.

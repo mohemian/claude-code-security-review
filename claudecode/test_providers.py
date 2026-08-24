@@ -257,3 +257,51 @@ class TestProviderProtocolSurface:
         for attribute in ('name', 'display_name', 'validate', 'build_prompt',
                           'run_security_audit', 'create_filter_client'):
             assert hasattr(provider, attribute), f'{name} is missing {attribute}'
+
+
+class TestPromptTooLongRetry:
+    """main()'s too-long retry must give Spark a smaller diff, not no diff at all."""
+
+    pr_data = {
+        'number': 9, 'title': 'Big change', 'body': '', 'user': 'bob', 'changed_files': 1,
+        'additions': 900, 'deletions': 0, 'files': [{'filename': 'app.py'}],
+        'head': {'repo': {'full_name': 'o/r'}},
+    }
+
+    def test_retry_reviews_a_truncated_diff(self, capsys):
+        from claudecode import github_action_audit as gaa
+
+        prompts_sent = []
+
+        def fake_post(url, **kwargs):
+            prompts_sent.append(kwargs['json']['messages'][-1]['content'])
+            response = Mock()
+            if len(prompts_sent) == 1:
+                response.status_code = 400
+                response.text = "This model's maximum context length is 32768 tokens."
+                return response
+            response.status_code = 200
+            response.text = ''
+            response.json.return_value = {'choices': [
+                {'message': {'content': '{"findings": []}'}, 'finish_reason': 'stop'}]}
+            return response
+
+        env = dict(SPARK_ENV, GITHUB_REPOSITORY='o/r', PR_NUMBER='9',
+                   GITHUB_TOKEN='gh-token', LLM_PROVIDER='spark')
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(gaa, 'GitHubActionClient') as mock_github, \
+                patch('claudecode.spark.requests.post', side_effect=fake_post):
+            client = Mock()
+            client.get_pr_data.return_value = self.pr_data
+            client.get_pr_diff.return_value = 'diff --git a/app.py b/app.py\n' + 'x' * 200_000
+            client._is_excluded.return_value = False
+            mock_github.return_value = client
+            with pytest.raises(SystemExit) as exc_info:
+                gaa.main()
+
+        assert exc_info.value.code == 0
+        assert len(prompts_sent) == 2, 'the too-long response should trigger exactly one retry'
+        assert 'diff truncated' in prompts_sent[1]
+        assert len(prompts_sent[1]) < len(prompts_sent[0])
+        # The retry must still contain code to review, not just a "diff omitted" note.
+        assert 'x' * 10_000 in prompts_sent[1]
