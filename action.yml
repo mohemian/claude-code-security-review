@@ -3,6 +3,11 @@ description: 'AI-powered security review GitHub Action using Claude to analyze c
 author: 'Anthropic'
 
 inputs:
+  provider:
+    description: 'LLM provider to use for the security review (anthropic | spark)'
+    required: false
+    default: 'anthropic'
+
   comment-pr:
     description: 'Whether to comment on PRs with findings'
     required: false
@@ -24,8 +29,8 @@ inputs:
     default: '20'
   
   claude-api-key:
-    description: 'Anthropic Claude API key for security analysis'
-    required: true
+    description: 'Anthropic Claude API key for security analysis (provider: anthropic)'
+    required: false
     default: ''
 
   claude-model:
@@ -48,6 +53,21 @@ inputs:
     required: false
     default: ''
 
+  vllm-base-url:
+    description: 'OpenAI-compatible vLLM base URL, e.g. http://localhost:8000/v1 (provider: spark). Falls back to the VLLM_BASE_URL environment variable.'
+    required: false
+    default: ''
+
+  vllm-model:
+    description: 'Model name served by vLLM, e.g. Qwen3-32B (provider: spark). Falls back to the VLLM_MODEL environment variable.'
+    required: false
+    default: ''
+
+  vllm-api-key:
+    description: 'Optional bearer token for the vLLM endpoint (provider: spark). Falls back to the VLLM_API_KEY environment variable.'
+    required: false
+    default: ''
+
 outputs:
   findings-count:
     description: 'Number of security findings'
@@ -64,8 +84,12 @@ runs:
       shell: bash
       run: |
         echo "::group::Install gh CLI"
-        # Install GitHub CLI for PR operations
-        sudo apt-get update && sudo apt-get install -y gh
+        # Install GitHub CLI for PR operations (self-hosted runners often ship it already)
+        if command -v gh >/dev/null 2>&1; then
+          echo "gh is already installed: $(gh --version | head -n1)"
+        else
+          sudo apt-get update && sudo apt-get install -y gh
+        fi
         echo "::endgroup::"
     
     - name: Set up Python
@@ -155,7 +179,7 @@ runs:
         key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
     
     - name: Set up Node.js
-      if: steps.claudecode-check.outputs.enable_claudecode == 'true'
+      if: steps.claudecode-check.outputs.enable_claudecode == 'true' && inputs.provider != 'spark'
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 pinned to commit hash
       with:
         node-version: '18'
@@ -164,13 +188,20 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        LLM_PROVIDER: ${{ inputs.provider }}
       run: |
         echo "::group::Install Deps"
         if [ "${{ steps.claudecode-check.outputs.enable_claudecode }}" == "true" ]; then
           pip install -r "$ACTION_PATH/claudecode/requirements.txt"
-          npm install -g @anthropic-ai/claude-code
+          # Claude Code and the Anthropic SDK are only needed by the anthropic provider.
+          if [ "$LLM_PROVIDER" != "spark" ]; then
+            pip install -r "$ACTION_PATH/claudecode/requirements-anthropic.txt"
+            npm install -g @anthropic-ai/claude-code
+          fi
         fi
-        sudo apt-get update && sudo apt-get install -y jq
+        if ! command -v jq >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y jq
+        fi
         echo "::endgroup::"
     
     - name: Run ClaudeCode scan
@@ -182,6 +213,10 @@ runs:
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         ANTHROPIC_API_KEY: ${{ inputs.claude-api-key }}
+        LLM_PROVIDER: ${{ inputs.provider }}
+        INPUT_VLLM_BASE_URL: ${{ inputs.vllm-base-url }}
+        INPUT_VLLM_MODEL: ${{ inputs.vllm-model }}
+        INPUT_VLLM_API_KEY: ${{ inputs.vllm-api-key }}
         ENABLE_CLAUDE_FILTERING: 'true' 
         EXCLUDE_DIRECTORIES: ${{ inputs.exclude-directories }}
         FALSE_POSITIVE_FILTERING_INSTRUCTIONS: ${{ inputs.false-positive-filtering-instructions }}
@@ -203,15 +238,47 @@ runs:
           exit 0
         fi
         
-        # Validate API key is provided
-        if [ -z "$ANTHROPIC_API_KEY" ]; then
-          echo "::error::ANTHROPIC_API_KEY is not set. Please provide the claude-api-key input to the action."
-          echo "Example usage:"
-          echo "  - uses: anthropics/claude-code-security-reviewer@main"
-          echo "    with:"
-          echo "      claude-api-key: \$\{{ secrets.ANTHROPIC_API_KEY }}"
-          exit 1
-        fi
+        # Action inputs win over inherited environment variables, but either works.
+        export VLLM_BASE_URL="${INPUT_VLLM_BASE_URL:-$VLLM_BASE_URL}"
+        export VLLM_MODEL="${INPUT_VLLM_MODEL:-$VLLM_MODEL}"
+        export VLLM_API_KEY="${INPUT_VLLM_API_KEY:-$VLLM_API_KEY}"
+        
+        # Provider-specific configuration validation
+        case "$LLM_PROVIDER" in
+          ""|anthropic)
+            export LLM_PROVIDER="anthropic"
+            if [ -z "$ANTHROPIC_API_KEY" ]; then
+              echo "::error::ANTHROPIC_API_KEY is not set. Please provide the claude-api-key input to the action."
+              echo "Example usage:"
+              echo "  - uses: anthropics/claude-code-security-reviewer@main"
+              echo "    with:"
+              echo "      claude-api-key: \$\{{ secrets.ANTHROPIC_API_KEY }}"
+              exit 1
+            fi
+            ;;
+          spark)
+            # The Spark provider talks to vLLM directly: no Claude Code, no Anthropic key.
+            unset ANTHROPIC_API_KEY
+            MISSING=""
+            if [ -z "$VLLM_BASE_URL" ]; then MISSING="$MISSING VLLM_BASE_URL"; fi
+            if [ -z "$VLLM_MODEL" ]; then MISSING="$MISSING VLLM_MODEL"; fi
+            if [ -n "$MISSING" ]; then
+              echo "::error::provider=spark requires:$MISSING"
+              echo "Example usage:"
+              echo "  - uses: mohemian/claude-code-security-review@main"
+              echo "    with:"
+              echo "      provider: spark"
+              echo "    env:"
+              echo "      VLLM_BASE_URL: http://localhost:8000/v1"
+              echo "      VLLM_MODEL: Qwen3-32B"
+              exit 1
+            fi
+            ;;
+          *)
+            echo "::error::Unsupported provider: '$LLM_PROVIDER'. Supported providers: anthropic, spark"
+            exit 1
+            ;;
+        esac
                 
         # Set timeout
         export CLAUDE_TIMEOUT="$CLAUDECODE_TIMEOUT"
@@ -224,8 +291,15 @@ runs:
         echo "::group::ClaudeCode Environment"
         echo "Current directory: $(pwd)"
         echo "Python version: $(python --version)"
-        echo "Claude CLI version: $(claude --version 2>&1 || echo 'Claude CLI not found')"
-        echo "ANTHROPIC_API_KEY set: $(if [ -n "$ANTHROPIC_API_KEY" ]; then echo 'Yes'; else echo 'No'; fi)"
+        echo "Provider: $LLM_PROVIDER"
+        if [ "$LLM_PROVIDER" == "spark" ]; then
+          echo "vLLM base URL: $VLLM_BASE_URL"
+          echo "vLLM model: $VLLM_MODEL"
+          echo "VLLM_API_KEY set: $(if [ -n "$VLLM_API_KEY" ]; then echo 'Yes'; else echo 'No'; fi)"
+        else
+          echo "Claude CLI version: $(claude --version 2>&1 || echo 'Claude CLI not found')"
+          echo "ANTHROPIC_API_KEY set: $(if [ -n "$ANTHROPIC_API_KEY" ]; then echo 'Yes'; else echo 'No'; fi)"
+        fi
         echo "GITHUB_REPOSITORY: $GITHUB_REPOSITORY"
         echo "PR_NUMBER: $PR_NUMBER"
         echo "Python path: $PYTHONPATH"

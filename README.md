@@ -1,6 +1,15 @@
 # Claude Code Security Reviewer
 
-An AI-powered security review GitHub Action using Claude to analyze code changes for security vulnerabilities. This action provides intelligent, context-aware security analysis for pull requests using Anthropic's Claude Code tool for deep semantic security analysis. See our blog post [here](https://www.anthropic.com/news/automate-security-reviews-with-claude-code) for more details.
+An AI-powered security review GitHub Action that analyzes code changes for security vulnerabilities. See the original blog post [here](https://www.anthropic.com/news/automate-security-reviews-with-claude-code) for more details.
+
+This is a fork of [`anthropics/claude-code-security-review`](https://github.com/anthropics/claude-code-security-review) that adds **pluggable LLM providers**. Pick one with the `provider` input:
+
+| Provider | Backend | Requires |
+|---|---|---|
+| `anthropic` (default) | Claude Code, agentic with repository tools | `ANTHROPIC_API_KEY` |
+| `spark` | Qwen3 on a DGX Spark, via an OpenAI-compatible vLLM endpoint | `VLLM_BASE_URL`, `VLLM_MODEL` |
+
+`provider` defaults to `anthropic`, so existing workflows keep working unchanged.
 
 ## Features
 
@@ -10,6 +19,7 @@ An AI-powered security review GitHub Action using Claude to analyze code changes
 - **Contextual Understanding**: Goes beyond pattern matching to understand code semantics
 - **Language Agnostic**: Works with any programming language
 - **False Positive Filtering**: Advanced filtering to reduce noise and focus on real vulnerabilities
+- **Pluggable Providers**: Run against Anthropic's Claude Code or a self-hosted Qwen3 on vLLM
 
 ## Quick Start
 
@@ -34,11 +44,85 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 2
       
-      - uses: anthropics/claude-code-security-review@main
+      - uses: mohemian/claude-code-security-review@main
         with:
           comment-pr: true
           claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
 ```
+
+## Providers
+
+### Anthropic (default)
+
+Uses the existing Claude Code implementation: Claude runs as an agent with repository
+exploration tools, so it can read files beyond the diff. This is the default and needs no
+new configuration.
+
+```yaml
+- uses: mohemian/claude-code-security-review@main
+  with:
+    provider: anthropic
+    claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+`ANTHROPIC_API_KEY` may also be supplied through the environment:
+
+```yaml
+- uses: mohemian/claude-code-security-review@main
+  with:
+    provider: anthropic
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+### DGX Spark / Qwen3
+
+Talks directly to an OpenAI-compatible vLLM endpoint (`POST $VLLM_BASE_URL/chat/completions`).
+It does **not** require Claude Code, the Anthropic SDK, or an Anthropic API key — neither is
+installed or read when `provider: spark`.
+
+```yaml
+jobs:
+  security:
+    runs-on: [self-hosted, dgx-spark]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+
+      - uses: mohemian/claude-code-security-review@main
+        with:
+          provider: spark
+        env:
+          VLLM_BASE_URL: http://localhost:8000/v1
+          VLLM_MODEL: Qwen3-...
+```
+
+The same settings are also available as action inputs (`vllm-base-url`, `vllm-model`,
+`vllm-api-key`), which take precedence over the environment variables.
+
+Unlike the Anthropic provider, Spark has **no tool access**: the model receives the PR
+metadata and diff in a single prompt and must answer with the same finding JSON. Its output
+is treated as untrusted and validated against the finding schema before anything is posted
+to GitHub; malformed output fails the run rather than being silently dropped.
+
+Both providers cover *all* LLM calls, including per-finding false-positive filtering — the
+Spark path never falls back to Anthropic.
+
+### Provider environment variables
+
+| Variable | Provider | Required | Description |
+|---|---|---|---|
+| `ANTHROPIC_API_KEY` | `anthropic` | Yes | Anthropic API key, enabled for both the Claude API and Claude Code. Equivalent to the `claude-api-key` input. |
+| `CLAUDE_MODEL` | `anthropic` | No | Claude model override. Equivalent to the `claude-model` input. |
+| `VLLM_BASE_URL` | `spark` | Yes | OpenAI-compatible base URL, e.g. `http://localhost:8000/v1`. |
+| `VLLM_MODEL` | `spark` | Yes | Model name as served by vLLM, e.g. `Qwen3-32B`. Passed through verbatim; no model name is hard-coded. |
+| `VLLM_API_KEY` | `spark` | No | Bearer token, if the endpoint requires one. A local DGX Spark deployment usually does not. |
+| `VLLM_TIMEOUT` | `spark` | No | Per-request timeout in seconds (default `900`). |
+
+Configuration is validated before any model call, and errors name exactly what is missing.
+An unsupported `provider` value fails immediately with the list of supported values.
 
 ## Security Considerations
 
@@ -50,7 +134,8 @@ This action is not hardened against prompt injection attacks and should only be 
 
 | Input | Description | Default | Required |
 |-------|-------------|---------|----------|
-| `claude-api-key` | Anthropic Claude API key for security analysis. <br>*Note*: This API key needs to be enabled for both the Claude API and Claude Code usage. | None | Yes |
+| `provider` | LLM provider to use: `anthropic` or `spark` | `anthropic` | No |
+| `claude-api-key` | Anthropic Claude API key for security analysis. <br>*Note*: This API key needs to be enabled for both the Claude API and Claude Code usage. | None | Yes for `provider: anthropic` |
 | `comment-pr` | Whether to comment on PRs with findings | `true` | No |
 | `upload-results` | Whether to upload results as artifacts | `true` | No |
 | `exclude-directories` | Comma-separated list of directories to exclude from scanning | None | No |
@@ -59,6 +144,9 @@ This action is not hardened against prompt injection attacks and should only be 
 | `run-every-commit` | Run ClaudeCode on every commit (skips cache check). Warning: May increase false positives on PRs with many commits. | `false` | No |
 | `false-positive-filtering-instructions` | Path to custom false positive filtering instructions text file | None | No |
 | `custom-security-scan-instructions` | Path to custom security scan instructions text file to append to audit prompt | None | No |
+| `vllm-base-url` | vLLM base URL; overrides `VLLM_BASE_URL` | None | Yes for `provider: spark` (or set `VLLM_BASE_URL`) |
+| `vllm-model` | Model served by vLLM; overrides `VLLM_MODEL` | None | Yes for `provider: spark` (or set `VLLM_MODEL`) |
+| `vllm-api-key` | Bearer token for the vLLM endpoint; overrides `VLLM_API_KEY` | None | No |
 
 ### Action Outputs
 
@@ -73,15 +161,38 @@ This action is not hardened against prompt injection attacks and should only be 
 
 ```
 claudecode/
-├── github_action_audit.py  # Main audit script for GitHub Actions
-├── prompts.py              # Security audit prompt templates
-├── findings_filter.py      # False positive filtering logic
-├── claude_api_client.py    # Claude API client for false positive filtering
-├── json_parser.py          # Robust JSON parsing utilities
-├── requirements.txt        # Python dependencies
-├── test_*.py               # Test suites
-└── evals/                  # Eval tooling to test CC on arbitrary PRs
+├── github_action_audit.py     # Main audit script for GitHub Actions
+├── providers.py               # Provider protocol, factory, Anthropic provider
+├── spark.py                   # Spark provider: vLLM client + finding validation
+├── prompts.py                 # Security audit prompt templates
+├── filter_prompts.py          # Shared false positive filtering prompts
+├── findings_filter.py         # False positive filtering logic
+├── claude_api_client.py       # Anthropic API client for false positive filtering
+├── json_parser.py             # Robust JSON parsing utilities
+├── requirements.txt           # Python dependencies
+├── requirements-anthropic.txt # Extra dependencies for provider: anthropic
+├── test_*.py                  # Test suites
+└── evals/                     # Eval tooling to test CC on arbitrary PRs
 ```
+
+Every LLM call goes through a provider:
+
+```
+        Security review
+              |
+              v
+        create_provider()
+         /            \
+AnthropicProvider   SparkProvider
+        |                 |
+   Claude Code           vLLM
+        |                 |
+     Claude              Qwen3
+```
+
+A provider owns both model calls — the security audit and false-positive filtering — so
+selecting a provider selects every LLM call. Everything else (hard exclusion rules,
+directory filtering, output assembly, PR commenting) is deterministic and provider-agnostic.
 
 ### Workflow
 

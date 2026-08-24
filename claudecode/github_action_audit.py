@@ -15,7 +15,7 @@ import re
 import time 
 
 # Import existing components we can reuse
-from claudecode.prompts import get_security_audit_prompt
+from claudecode.providers import DEFAULT_PROVIDER, SUPPORTED_PROVIDERS, create_provider
 from claudecode.findings_filter import FindingsFilter
 from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.constants import (
@@ -372,11 +372,32 @@ def get_environment_config() -> Tuple[str, int]:
     return repo_name, pr_number
 
 
-def initialize_clients() -> Tuple[GitHubActionClient, SimpleClaudeRunner]:
-    """Initialize GitHub and Claude clients.
+def get_provider_name() -> str:
+    """Get and validate the configured LLM provider name.
     
     Returns:
-        Tuple of (github_client, claude_runner)
+        A provider name from SUPPORTED_PROVIDERS
+        
+    Raises:
+        ConfigurationError: If the configured provider is not supported
+    """
+    name = (os.environ.get('LLM_PROVIDER') or DEFAULT_PROVIDER).strip().lower()
+    if name not in SUPPORTED_PROVIDERS:
+        raise ConfigurationError(
+            f"Unsupported provider: {os.environ.get('LLM_PROVIDER')!r}. "
+            f"Supported providers: {', '.join(SUPPORTED_PROVIDERS)}"
+        )
+    return name
+
+
+def initialize_clients(provider_name: Optional[str] = None) -> Tuple[GitHubActionClient, Any]:
+    """Initialize the GitHub client and the LLM provider.
+    
+    Args:
+        provider_name: Provider to use; defaults to `anthropic`
+        
+    Returns:
+        Tuple of (github_client, provider)
         
     Raises:
         ConfigurationError: If client initialization fails
@@ -386,19 +407,26 @@ def initialize_clients() -> Tuple[GitHubActionClient, SimpleClaudeRunner]:
     except Exception as e:
         raise ConfigurationError(f'Failed to initialize GitHub client: {str(e)}')
     
+    name = provider_name or DEFAULT_PROVIDER
     try:
-        claude_runner = SimpleClaudeRunner()
+        provider = create_provider(name)
+    except ValueError as e:
+        raise ConfigurationError(str(e))
     except Exception as e:
-        raise ConfigurationError(f'Failed to initialize Claude runner: {str(e)}')
+        label = 'Claude runner' if name == DEFAULT_PROVIDER else f'{name} provider'
+        raise ConfigurationError(f'Failed to initialize {label}: {str(e)}')
         
-    return github_client, claude_runner
+    return github_client, provider
 
 
-def initialize_findings_filter(custom_filtering_instructions: Optional[str] = None) -> FindingsFilter:
+def initialize_findings_filter(custom_filtering_instructions: Optional[str] = None,
+                               provider: Optional[Any] = None) -> FindingsFilter:
     """Initialize findings filter based on environment configuration.
     
     Args:
         custom_filtering_instructions: Optional custom filtering instructions
+        provider: LLM provider supplying the filtering client. When omitted the legacy
+            Anthropic-from-environment behaviour is used.
         
     Returns:
         FindingsFilter instance
@@ -407,8 +435,25 @@ def initialize_findings_filter(custom_filtering_instructions: Optional[str] = No
         ConfigurationError: If filter initialization fails
     """
     try:
-        # Check if we should use Claude API filtering
+        # Check if we should use LLM-based filtering
         use_claude_filtering = os.environ.get('ENABLE_CLAUDE_FILTERING', 'false').lower() == 'true'
+        
+        if provider is not None:
+            # Provider-owned filtering: no ANTHROPIC_API_KEY lookup on non-Anthropic paths.
+            client = provider.create_filter_client() if use_claude_filtering else None
+            if client is None:
+                logger.info('LLM-based false positive filtering disabled; using hard rules only')
+                return FindingsFilter(
+                    use_hard_exclusions=True,
+                    use_claude_filtering=False
+                )
+            return FindingsFilter(
+                use_hard_exclusions=True,
+                use_claude_filtering=True,
+                client=client,
+                custom_filtering_instructions=custom_filtering_instructions
+            )
+        
         api_key = os.environ.get('ANTHROPIC_API_KEY')
         
         if use_claude_filtering and api_key:
@@ -524,6 +569,7 @@ def main():
         # Get environment configuration
         try:
             repo_name, pr_number = get_environment_config()
+            provider_name = get_provider_name()
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
@@ -552,22 +598,22 @@ def main():
         
         # Initialize components
         try:
-            github_client, claude_runner = initialize_clients()
+            github_client, provider = initialize_clients(provider_name)
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
             
         # Initialize findings filter
         try:
-            findings_filter = initialize_findings_filter(custom_filtering_instructions)
+            findings_filter = initialize_findings_filter(custom_filtering_instructions, provider)
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
         
-        # Validate Claude Code is available
-        claude_ok, claude_error = claude_runner.validate_claude_available()
-        if not claude_ok:
-            print(json.dumps({'error': f'Claude Code not available: {claude_error}'}))
+        # Validate the provider is configured and usable
+        provider_ok, provider_error = provider.validate()
+        if not provider_ok:
+            print(json.dumps({'error': f'{provider.display_name} not available: {provider_error}'}))
             sys.exit(EXIT_GENERAL_ERROR)
         
         # Get PR data
@@ -579,20 +625,20 @@ def main():
             sys.exit(EXIT_GENERAL_ERROR)
                 
         # Generate security audit prompt
-        prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
+        prompt = provider.build_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
         
-        # Run Claude Code security audit
+        # Run the security audit
         # Get repo directory from environment or use current directory
         repo_path = os.environ.get('REPO_PATH')
         repo_dir = Path(repo_path) if repo_path else Path.cwd()
-        success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt)
+        success, error_msg, results = provider.run_security_audit(repo_dir, prompt)
         
-        # If prompt is too long, retry without diff
+        # If prompt is too long, retry with a smaller one
         if not success and error_msg == "PROMPT_TOO_LONG":
-            print(f"[Info] Prompt too long, retrying without diff. Original prompt length: {len(prompt)} characters", file=sys.stderr)
-            prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
+            print(f"[Info] Prompt too long, retrying with a reduced prompt. Original prompt length: {len(prompt)} characters", file=sys.stderr)
+            prompt_without_diff = provider.build_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
             print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
-            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
+            success, error_msg, results = provider.run_security_audit(repo_dir, prompt_without_diff)
         
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))
@@ -618,6 +664,7 @@ def main():
         output = {
             'pr_number': pr_number,
             'repo': repo_name,
+            'provider': provider.name,
             'findings': kept_findings,
             'analysis_summary': results.get('analysis_summary', {}),
             'filtering_summary': {

@@ -5,7 +5,6 @@ from typing import Dict, Any, List, Tuple, Optional, Pattern
 import time
 from dataclasses import dataclass, field
 
-from claudecode.claude_api_client import ClaudeAPIClient
 from claudecode.constants import DEFAULT_CLAUDE_MODEL
 from claudecode.logger import get_logger
 
@@ -162,36 +161,41 @@ class FindingsFilter:
                  use_claude_filtering: bool = True,
                  api_key: Optional[str] = None,
                  model: str = DEFAULT_CLAUDE_MODEL,
-                 custom_filtering_instructions: Optional[str] = None):
+                 custom_filtering_instructions: Optional[str] = None,
+                 client: Optional[Any] = None):
         """Initialize findings filter.
         
         Args:
             use_hard_exclusions: Whether to apply hard exclusion rules
-            use_claude_filtering: Whether to use Claude API for filtering
-            api_key: Anthropic API key for Claude filtering
-            model: Claude model to use for filtering
+            use_claude_filtering: Whether to use an LLM for filtering
+            api_key: Anthropic API key for Claude filtering (ignored when `client` is given)
+            model: Claude model to use for filtering (ignored when `client` is given)
             custom_filtering_instructions: Optional custom filtering instructions
+            client: Pre-built LLM client from a provider. Must expose
+                `validate_api_access()` and `analyze_single_finding()`. When omitted the
+                Anthropic client is built from `api_key`/`model` as before.
         """
         self.use_hard_exclusions = use_hard_exclusions
         self.use_claude_filtering = use_claude_filtering
         self.custom_filtering_instructions = custom_filtering_instructions
         
-        # Initialize Claude client if filtering is enabled
+        # Initialize LLM client if filtering is enabled
         self.claude_client = None
         if self.use_claude_filtering:
             try:
-                self.claude_client = ClaudeAPIClient(
-                    model=model,
-                    api_key=api_key
-                )
+                if client is None:
+                    from claudecode.claude_api_client import ClaudeAPIClient
+
+                    client = ClaudeAPIClient(model=model, api_key=api_key)
+                self.claude_client = client
                 # Validate API access
                 valid, error = self.claude_client.validate_api_access()
                 if not valid:
-                    logger.warning(f"Claude API validation failed: {error}")
+                    logger.warning(f"LLM API validation failed: {error}")
                     self.claude_client = None
                     self.use_claude_filtering = False
             except Exception as e:
-                logger.error(f"Failed to initialize Claude client: {str(e)}")
+                logger.error(f"Failed to initialize LLM client: {str(e)}")
                 self.use_claude_filtering = False
     
     def filter_findings(self, 
