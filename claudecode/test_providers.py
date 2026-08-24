@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the LLM provider abstraction: selection, configuration and isolation."""
 
+import json
 import os
 import subprocess
 import sys
@@ -305,3 +306,28 @@ class TestPromptTooLongRetry:
         assert len(prompts_sent[1]) < len(prompts_sent[0])
         # The retry must still contain code to review, not just a "diff omitted" note.
         assert 'x' * 10_000 in prompts_sent[1]
+
+    def test_still_too_long_after_retry_gives_a_human_error(self, capsys):
+        from claudecode import github_action_audit as gaa
+
+        def always_too_long(url, **kwargs):
+            return Mock(status_code=400,
+                        text="This model's maximum context length is 32768 tokens.")
+
+        env = dict(SPARK_ENV, GITHUB_REPOSITORY='o/r', PR_NUMBER='9',
+                   GITHUB_TOKEN='gh-token', LLM_PROVIDER='spark')
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(gaa, 'GitHubActionClient') as mock_github, \
+                patch('claudecode.spark.requests.post', side_effect=always_too_long):
+            client = Mock()
+            client.get_pr_data.return_value = self.pr_data
+            client.get_pr_diff.return_value = 'x' * 500_000
+            client._is_excluded.return_value = False
+            mock_github.return_value = client
+            with pytest.raises(SystemExit):
+                gaa.main()
+
+        error = json.loads(capsys.readouterr().out)['error']
+        assert 'PROMPT_TOO_LONG' not in error, 'internal sentinel leaked to the user'
+        assert 'too large for the model context window' in error
+        assert 'exclude-directories' in error

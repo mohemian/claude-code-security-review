@@ -639,6 +639,12 @@ def main():
             prompt_without_diff = provider.build_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
             print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
             success, error_msg, results = provider.run_security_audit(repo_dir, prompt_without_diff)
+            if not success and error_msg == "PROMPT_TOO_LONG":
+                error_msg = (
+                    'the PR is too large for the model context window, even after reducing '
+                    'the diff. Exclude directories with `exclude-directories`, or use a '
+                    'model with a larger context window.'
+                )
         
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))

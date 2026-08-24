@@ -264,6 +264,54 @@ It is also possible to configure custom scanning and false positive filtering in
 
 ## Testing
 
+### Unit tests
+
+```bash
+pip install pytest && pip install -r claudecode/requirements.txt
+pip install -r claudecode/requirements-anthropic.txt   # only for the anthropic tests
+PYTHONPATH=$PWD pytest claudecode -q
+```
+
+### Dry-running a provider against a real PR
+
+`github_action_audit.py` is a plain script: give it a PR and it prints the findings JSON to
+stdout. Nothing is posted to GitHub (PR comments are a separate action step), so this is
+safe to point at any PR you can read.
+
+```bash
+GITHUB_TOKEN=$(gh auth token) \
+GITHUB_REPOSITORY=owner/repo PR_NUMBER=123 \
+LLM_PROVIDER=spark ENABLE_CLAUDE_FILTERING=true \
+VLLM_BASE_URL=http://localhost:8000/v1 VLLM_MODEL=Qwen3-32B \
+REPO_PATH=$PWD PYTHONPATH=$PWD python claudecode/github_action_audit.py
+```
+
+Swap in `LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-...` to dry-run the other provider
+(that one needs the `claude` CLI on PATH and a checkout of the repo under review at
+`REPO_PATH`, since Claude Code explores it).
+
+### Testing Spark without a DGX Spark
+
+`scripts/fake-vllm-server.py` stands in for vLLM and speaks enough of the OpenAI API to
+exercise the real HTTP path, including the failure modes:
+
+```bash
+python3 scripts/fake-vllm-server.py --port 8000 --mode findings
+# modes: findings | empty | malformed | prose | toolong | flaky
+```
+
+Then run the dry-run command above against `http://localhost:8000/v1`. Expected results:
+
+| Mode | Expected |
+|---|---|
+| `findings` | exit 1, one HIGH finding, two vLLM calls (audit + filter) |
+| `empty` | exit 0, no findings |
+| `malformed` | exit 1, `Invalid security report from model: findings[0] has severity ...` |
+| `prose` | exit 1, `Could not parse JSON from vLLM response` |
+| `toolong` | two audit calls, then an error telling you to exclude directories |
+| `flaky` | HTTP 500 retried, then a normal result |
+
+
 Run the test suite to validate functionality:
 
 ```bash
