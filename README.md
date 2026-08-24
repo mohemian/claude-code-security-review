@@ -110,6 +110,24 @@ to GitHub; malformed output fails the run rather than being silently dropped.
 Both providers cover *all* LLM calls, including per-finding false-positive filtering — the
 Spark path never falls back to Anthropic.
 
+#### Reasoning models and the output budget
+
+vLLM returns a reasoning model's trace in a separate `reasoning` field, but that trace is
+generated *first* and counts against `max_tokens`. If the budget runs out mid-trace, the
+response comes back with `finish_reason: "length"` and **no content at all** — the model
+never reached its answer.
+
+Measured on Qwen3.8-27B reviewing a ~40k-token diff: with reasoning on it consumed a full
+16k-token budget and produced nothing, taking over ten minutes. With
+`VLLM_ENABLE_THINKING=false` the same review completed in well under a minute.
+
+The default budget is therefore `32768`, and a truncated response is always reported as an
+error rather than parsed as a partial report. If you see one, either raise
+`VLLM_MAX_TOKENS` or set `VLLM_ENABLE_THINKING=false`.
+
+> Whether reasoning improves finding quality enough to pay for is a benchmarking question,
+> not a settled one. The knob is there so you can measure it.
+
 ### Provider environment variables
 
 | Variable | Provider | Required | Description |
@@ -120,6 +138,8 @@ Spark path never falls back to Anthropic.
 | `VLLM_MODEL` | `spark` | Yes | Model name as served by vLLM, e.g. `Qwen3-32B`. Passed through verbatim; no model name is hard-coded. |
 | `VLLM_API_KEY` | `spark` | No | Bearer token, if the endpoint requires one. A local DGX Spark deployment usually does not. |
 | `VLLM_TIMEOUT` | `spark` | No | Per-request timeout in seconds (default `900`). |
+| `VLLM_MAX_TOKENS` | `spark` | No | Output budget per call (default `32768`). A reasoning model spends this on its reasoning trace *before* writing any answer, so it needs headroom — see below. |
+| `VLLM_ENABLE_THINKING` | `spark` | No | Set `false` to switch the model's reasoning off (`chat_template_kwargs.enable_thinking`). Unset leaves the served model's own default alone. |
 
 Configuration is validated before any model call, and errors name exactly what is missing.
 An unsupported `provider` value fails immediately with the list of supported values.
@@ -310,6 +330,17 @@ Then run the dry-run command above against `http://localhost:8000/v1`. Expected 
 | `prose` | exit 1, `Could not parse JSON from vLLM response` |
 | `toolong` | two audit calls, then an error telling you to exclude directories |
 | `flaky` | HTTP 500 retried, then a normal result |
+
+### Positive control
+
+A scanner that finds nothing looks identical to a scanner that is broken. `examples/vulnerable_sample.py`
+(on the `test/planted-vuln` branch, PR #2) carries a SQL injection, a command injection and
+a path traversal for exactly that reason — point a provider at that PR and confirm all three
+come back before trusting a clean result on real code.
+
+Note that the false-positive filter reads each finding's file from disk, so `REPO_PATH` must
+point at a checkout of the **PR head**. If the file is missing the filter is told so, and
+tends to discard the finding — a clean report from the wrong checkout means nothing.
 
 
 Run the test suite to validate functionality:

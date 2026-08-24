@@ -454,3 +454,57 @@ class TestFilterFileReadContainment:
             success, _, error = filter_prompts.read_repo_file(str(secret))
         assert success is False
         assert 'outside the repository' in error
+
+
+class TestOutputBudget:
+    """A reasoning model spends max_tokens on its trace before writing any answer."""
+
+    def truncated(self, content, reasoning):
+        response = Mock(status_code=200, text='')
+        response.json.return_value = {'choices': [{
+            'finish_reason': 'length',
+            'message': {'role': 'assistant', 'content': content, 'reasoning': reasoning}}]}
+        return response
+
+    @patch('claudecode.spark.requests.post')
+    def test_budget_exhausted_by_reasoning_names_the_cause(self, mock_post):
+        mock_post.return_value = self.truncated(None, 'let me think about this...')
+        success, _, error = make_client(max_tokens=16384).chat(
+            [{'role': 'user', 'content': 'x'}])
+        assert success is False
+        assert 'reasoning trace' in error
+        assert '16384' in error
+        assert 'VLLM_MAX_TOKENS' in error and 'VLLM_ENABLE_THINKING' in error
+
+    @patch('claudecode.spark.requests.post')
+    def test_truncated_report_is_rejected(self, mock_post):
+        mock_post.return_value = self.truncated('{"findings": [{"file": "a.py"', '')
+        success, _, error = make_client().chat([{'role': 'user', 'content': 'x'}])
+        assert success is False, 'a truncated report must never be parsed as findings'
+        assert 'truncated' in error
+
+    @patch('claudecode.spark.requests.post')
+    def test_thinking_toggle_is_sent_only_when_configured(self, mock_post):
+        mock_post.return_value = chat_response('{"findings": []}')
+        make_client().chat([{'role': 'user', 'content': 'x'}])
+        assert 'chat_template_kwargs' not in mock_post.call_args[1]['json']
+
+        make_client(enable_thinking=False).chat([{'role': 'user', 'content': 'x'}])
+        assert mock_post.call_args[1]['json']['chat_template_kwargs'] == {
+            'enable_thinking': False}
+
+    @patch('claudecode.spark.requests.post')
+    def test_budget_comes_from_the_environment(self, mock_post):
+        mock_post.return_value = chat_response('{"findings": []}')
+        with patch.dict(os.environ, {'VLLM_BASE_URL': BASE_URL, 'VLLM_MODEL': MODEL,
+                                     'VLLM_MAX_TOKENS': '4096',
+                                     'VLLM_ENABLE_THINKING': 'false'}, clear=True):
+            client = VLLMClient.from_env()
+        assert client.max_tokens == 4096
+        assert client.enable_thinking is False
+        client.chat([{'role': 'user', 'content': 'x'}])
+        assert mock_post.call_args[1]['json']['max_tokens'] == 4096
+
+    def test_default_budget_is_larger_than_the_old_anthropic_constant(self):
+        """16384 was an Anthropic-era constant; it is not enough for a reasoning model."""
+        assert make_client().max_tokens >= 32768

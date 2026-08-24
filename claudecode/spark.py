@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from claudecode import filter_prompts
-from claudecode.constants import PROMPT_TOKEN_LIMIT
 from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.logger import get_logger
 from claudecode import prompts
@@ -28,6 +27,11 @@ logger = get_logger(__name__)
 
 DEFAULT_REQUEST_TIMEOUT = 900  # seconds; a full-diff audit on a local GPU is slow
 DEFAULT_MAX_RETRIES = 3
+
+# Output budget per call. A reasoning model spends this on its reasoning trace *before*
+# it writes any answer, so it has to be generous: Qwen3 will happily burn 16k tokens
+# thinking about a large diff and never reach the JSON.
+DEFAULT_MAX_TOKENS = 32768
 PROMPT_TOO_LONG = 'PROMPT_TOO_LONG'
 
 # Retry-on-oversize fallback: how much diff to keep when the model refused the full one.
@@ -66,12 +70,17 @@ class VLLMClient:
                  model: Optional[str] = None,
                  api_key: Optional[str] = None,
                  timeout_seconds: Optional[int] = None,
-                 max_retries: int = DEFAULT_MAX_RETRIES):
+                 max_retries: int = DEFAULT_MAX_RETRIES,
+                 max_tokens: Optional[int] = None,
+                 enable_thinking: Optional[bool] = None):
         self.base_url = (base_url or '').strip().rstrip('/')
         self.model = (model or '').strip()
         self.api_key = api_key or None
         self.timeout_seconds = timeout_seconds or DEFAULT_REQUEST_TIMEOUT
         self.max_retries = max_retries
+        self.max_tokens = max_tokens or DEFAULT_MAX_TOKENS
+        # None leaves the served model's own default alone.
+        self.enable_thinking = enable_thinking
         # Set to False after the server rejects `response_format`.
         self.json_mode = True
 
@@ -79,11 +88,16 @@ class VLLMClient:
     def from_env(cls) -> 'VLLMClient':
         """Build a client from VLLM_BASE_URL / VLLM_MODEL / VLLM_API_KEY."""
         timeout = os.environ.get('VLLM_TIMEOUT')
+        max_tokens = os.environ.get('VLLM_MAX_TOKENS')
+        thinking = os.environ.get('VLLM_ENABLE_THINKING')
         return cls(
             base_url=os.environ.get('VLLM_BASE_URL'),
             model=os.environ.get('VLLM_MODEL'),
             api_key=os.environ.get('VLLM_API_KEY'),
             timeout_seconds=int(timeout) if timeout and timeout.isdigit() else None,
+            max_tokens=int(max_tokens) if max_tokens and max_tokens.isdigit() else None,
+            enable_thinking=(thinking.strip().lower() in ('1', 'true', 'yes')
+                             if thinking else None),
         )
 
     @property
@@ -110,7 +124,7 @@ class VLLMClient:
         return self.validate()
 
     def chat(self, messages: List[Dict[str, str]],
-             max_tokens: int = PROMPT_TOKEN_LIMIT,
+             max_tokens: Optional[int] = None,
              temperature: float = 0.0) -> Tuple[bool, str, str]:
         """Call the chat completions endpoint.
 
@@ -122,6 +136,7 @@ class VLLMClient:
         if not ok:
             return False, '', error
 
+        max_tokens = max_tokens or self.max_tokens
         headers = {'Content-Type': 'application/json'}
         if self.api_key:
             headers['Authorization'] = f'Bearer {self.api_key}'
@@ -137,6 +152,8 @@ class VLLMClient:
             }
             if self.json_mode:
                 payload['response_format'] = {'type': 'json_object'}
+            if self.enable_thinking is not None:
+                payload['chat_template_kwargs'] = {'enable_thinking': self.enable_thinking}
 
             try:
                 response = requests.post(
@@ -175,7 +192,7 @@ class VLLMClient:
             except ValueError:
                 return False, '', f'vLLM returned non-JSON body: {response.text[:300]}'
 
-            success, content, error = _extract_content(data)
+            success, content, error = _extract_content(data, max_tokens)
             if success:
                 return True, content, ''
             return False, '', error
@@ -183,7 +200,7 @@ class VLLMClient:
         return False, '', f'vLLM call failed after {self.max_retries} attempts: {last_error}'
 
 
-def _extract_content(data: Any) -> Tuple[bool, str, str]:
+def _extract_content(data: Any, max_tokens: int) -> Tuple[bool, str, str]:
     """Pull the assistant message out of an OpenAI-compatible response."""
     if not isinstance(data, dict):
         return False, '', 'vLLM response was not a JSON object'
@@ -199,11 +216,25 @@ def _extract_content(data: Any) -> Tuple[bool, str, str]:
         return False, '', 'vLLM response choice contained no message'
 
     content = message.get('content')
+
+    # A reasoning model emits its trace first, in a separate field. If the budget runs
+    # out mid-trace there is no answer at all, and the raw symptom ("no content") says
+    # nothing useful -- so name the actual cause and the two ways out.
+    if choices[0].get('finish_reason') == 'length':
+        reasoning = message.get('reasoning') or message.get('reasoning_content') or ''
+        if not (content or '').strip() and reasoning:
+            return False, '', (
+                f'the model spent its entire {max_tokens}-token output budget on its '
+                f'reasoning trace without producing an answer. Raise VLLM_MAX_TOKENS, or '
+                f'set VLLM_ENABLE_THINKING=false to skip reasoning entirely.'
+            )
+        return False, '', (
+            f'the model hit the {max_tokens}-token output budget, so its report is '
+            f'truncated and cannot be trusted. Raise VLLM_MAX_TOKENS.'
+        )
+
     if not isinstance(content, str) or not content.strip():
         return False, '', 'vLLM response message contained no content'
-
-    if choices[0].get('finish_reason') == 'length':
-        logger.warning('vLLM response was truncated by max_tokens; JSON may be incomplete')
 
     return True, strip_reasoning(content), ''
 
