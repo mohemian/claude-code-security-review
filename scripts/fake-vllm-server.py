@@ -19,10 +19,11 @@ Modes (--mode) let you rehearse the failure paths:
 
 import argparse
 import json
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 FINDING = {
-    'file': 'app.py', 'line': 42, 'severity': 'HIGH', 'category': 'sql_injection',
+    'file': 'app.py', 'line': 1, 'severity': 'HIGH', 'category': 'sql_injection',
     'description': 'User input is interpolated into a SQL query',
     'exploit_scenario': "Attacker submits 1' OR '1'='1 as the search parameter",
     'recommendation': 'Use parameterised queries', 'confidence': 0.95,
@@ -35,6 +36,23 @@ BODIES = {
     'empty': {'findings': [], 'analysis_summary': {'files_reviewed': 1}},
     'malformed': {'findings': [dict(FINDING, severity='CATASTROPHIC')]},
 }
+
+
+def _first_diff_location(prompt):
+    """Find a (file, line) that is genuinely inside the PR diff.
+
+    GitHub only accepts a review comment on a line the diff touches, so anchoring the
+    canned finding to the first hunk keeps the PR-commenting step honest.
+    """
+    diff = re.search(r'^diff --git a/(\S+) b/\S+(.*?)(?=^diff --git |\Z)',
+                     prompt, re.MULTILINE | re.DOTALL)
+    if diff:
+        hunk = re.search(r'^@@ -\d+(?:,\d+)? \+(\d+)', diff.group(2), re.MULTILINE)
+        if hunk:
+            return diff.group(1), int(hunk.group(1))
+
+    listed = re.search(r'^Files modified:\n- (.+)$', prompt, re.MULTILINE)
+    return (listed.group(1).strip() if listed else 'app.py'), 1
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -62,7 +80,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.mode == 'prose':
             content = 'I was unable to complete this security review.'
         else:
-            content = json.dumps(BODIES.get(self.mode, BODIES['findings']))
+            body = json.loads(json.dumps(BODIES.get(self.mode, BODIES['findings'])))
+            # Report against a file that is really in the PR, so the finding survives
+            # validation and GitHub accepts the review comment.
+            changed_file, changed_line = _first_diff_location(prompt)
+            for finding in body['findings']:
+                finding['file'] = changed_file
+                finding['line'] = changed_line
+            content = json.dumps(body)
 
         self._send(200, json.dumps({
             'model': request.get('model'),
