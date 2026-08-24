@@ -331,3 +331,35 @@ class TestPromptTooLongRetry:
         assert 'PROMPT_TOO_LONG' not in error, 'internal sentinel leaked to the user'
         assert 'too large for the model context window' in error
         assert 'exclude-directories' in error
+
+
+class TestClaudeCodeOAuthToken:
+    """A subscription OAuth token authenticates Claude Code, but not the Messages API."""
+
+    @patch('claudecode.github_action_audit.subprocess.run')
+    def test_oauth_token_satisfies_validation(self, mock_run):
+        mock_run.return_value = Mock(returncode=0, stdout='1.0.0', stderr='')
+        with patch.dict(os.environ, {'CLAUDE_CODE_OAUTH_TOKEN': 'sk-ant-oat01-x'}, clear=True):
+            ok, error = create_provider('anthropic').validate()
+        assert ok is True, error
+
+    @patch('claudecode.github_action_audit.subprocess.run')
+    def test_neither_credential_is_reported(self, mock_run):
+        mock_run.return_value = Mock(returncode=0, stdout='1.0.0', stderr='')
+        with patch.dict(os.environ, {}, clear=True):
+            ok, error = create_provider('anthropic').validate()
+        assert ok is False
+        assert 'ANTHROPIC_API_KEY' in error
+        assert 'CLAUDE_CODE_OAUTH_TOKEN' in error
+
+    def test_oauth_only_disables_llm_filtering_loudly(self, caplog):
+        """It must not look like the filter simply found nothing to exclude."""
+        with patch.dict(os.environ, {'CLAUDE_CODE_OAUTH_TOKEN': 'sk-ant-oat01-x',
+                                     'ENABLE_CLAUDE_FILTERING': 'true'}, clear=True):
+            provider = create_provider('anthropic')
+            with caplog.at_level('WARNING'):
+                client = provider.create_filter_client()
+            findings_filter = initialize_findings_filter(None, provider)
+        assert client is None
+        assert findings_filter.use_claude_filtering is False
+        assert any('not the Anthropic API' in r.message for r in caplog.records)

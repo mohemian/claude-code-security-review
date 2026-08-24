@@ -323,10 +323,13 @@ class SimpleClaudeRunner:
             )
             
             if result.returncode == 0:
-                # Also check if API key is configured
-                api_key = os.environ.get('ANTHROPIC_API_KEY', '')
-                if not api_key:
-                    return False, "ANTHROPIC_API_KEY environment variable is not set"
+                # Either credential authenticates Claude Code: an API key, or a
+                # subscription OAuth token (see the Claude Code GitHub Actions docs).
+                credential = (os.environ.get('ANTHROPIC_API_KEY', '')
+                              or os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', ''))
+                if not credential:
+                    return False, ("ANTHROPIC_API_KEY environment variable is not set "
+                                   "(CLAUDE_CODE_OAUTH_TOKEN also works)")
                 return True, ""
             else:
                 error_msg = f"Claude Code returned exit code {result.returncode}"

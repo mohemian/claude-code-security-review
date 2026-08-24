@@ -110,6 +110,20 @@ to GitHub; malformed output fails the run rather than being silently dropped.
 Both providers cover *all* LLM calls, including per-finding false-positive filtering — the
 Spark path never falls back to Anthropic.
 
+#### Anthropic credentials
+
+\* One of `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` is required. They are not
+interchangeable, because the two Anthropic call sites authenticate differently:
+
+| | Claude Code CLI (the audit) | Messages API (false-positive filtering) |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | yes | yes |
+| `CLAUDE_CODE_OAUTH_TOKEN` | yes | **no** — the API rejects it with `401` |
+
+With an OAuth token the audit runs normally and false-positive filtering falls back to the
+deterministic hard exclusion rules. The action emits a warning when this happens, so a
+noisier-than-usual report has a visible cause rather than looking like a clean filter pass.
+
 #### Reasoning models and the output budget
 
 vLLM returns a reasoning model's trace in a separate `reasoning` field, but that trace is
@@ -132,7 +146,8 @@ error rather than parsed as a partial report. If you see one, either raise
 
 | Variable | Provider | Required | Description |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | `anthropic` | Yes | Anthropic API key, enabled for both the Claude API and Claude Code. Equivalent to the `claude-api-key` input. |
+| `ANTHROPIC_API_KEY` | `anthropic` | Yes* | Anthropic API key, enabled for both the Claude API and Claude Code. Equivalent to the `claude-api-key` input. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | `anthropic` | Yes* | Claude Code subscription OAuth token (`sk-ant-oat01-...`), as an alternative to the API key. Equivalent to the `claude-code-oauth-token` input. **Runs the audit but not the filtering** — see below. |
 | `CLAUDE_MODEL` | `anthropic` | No | Claude model override. Equivalent to the `claude-model` input. |
 | `VLLM_BASE_URL` | `spark` | Yes | OpenAI-compatible base URL, e.g. `http://localhost:8000/v1`. |
 | `VLLM_MODEL` | `spark` | Yes | Model name as served by vLLM, e.g. `Qwen3-32B`. Passed through verbatim; no model name is hard-coded. |
@@ -341,6 +356,12 @@ come back before trusting a clean result on real code.
 Note that the false-positive filter reads each finding's file from disk, so `REPO_PATH` must
 point at a checkout of the **PR head**. If the file is missing the filter is told so, and
 tends to discard the finding — a clean report from the wrong checkout means nothing.
+
+Both providers have been run against that fixture and found all three issues. One known
+difference: on this sample Qwen3 reported line numbers roughly two lines earlier than the
+vulnerable expression (pointing at comments and setup), where Claude Code was exact. Line
+numbers drive review-comment placement, and GitHub rejects a comment on a line outside the
+diff, so this is worth measuring before relying on Spark for inline comments.
 
 
 Run the test suite to validate functionality:

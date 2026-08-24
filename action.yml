@@ -33,6 +33,11 @@ inputs:
     required: false
     default: ''
 
+  claude-code-oauth-token:
+    description: 'Claude Code OAuth token, as an alternative to claude-api-key (provider: anthropic). Authenticates Claude Code but not the Anthropic API, so LLM-based false positive filtering is skipped. Falls back to the CLAUDE_CODE_OAUTH_TOKEN environment variable.'
+    required: false
+    default: ''
+
   claude-model:
     description: 'Claude model to use for security analysis (e.g., claude-sonnet-4-20250514)'
     required: false
@@ -220,6 +225,7 @@ runs:
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         ANTHROPIC_API_KEY: ${{ inputs.claude-api-key }}
+        INPUT_CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
         LLM_PROVIDER: ${{ inputs.provider }}
         INPUT_VLLM_BASE_URL: ${{ inputs.vllm-base-url }}
         INPUT_VLLM_MODEL: ${{ inputs.vllm-model }}
@@ -249,18 +255,26 @@ runs:
         export VLLM_BASE_URL="${INPUT_VLLM_BASE_URL:-$VLLM_BASE_URL}"
         export VLLM_MODEL="${INPUT_VLLM_MODEL:-$VLLM_MODEL}"
         export VLLM_API_KEY="${INPUT_VLLM_API_KEY:-$VLLM_API_KEY}"
+        export CLAUDE_CODE_OAUTH_TOKEN="${INPUT_CLAUDE_CODE_OAUTH_TOKEN:-$CLAUDE_CODE_OAUTH_TOKEN}"
         
         # Provider-specific configuration validation
         case "$LLM_PROVIDER" in
           ""|anthropic)
             export LLM_PROVIDER="anthropic"
-            if [ -z "$ANTHROPIC_API_KEY" ]; then
+            if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
               echo "::error::ANTHROPIC_API_KEY is not set. Please provide the claude-api-key input to the action."
               echo "Example usage:"
               echo "  - uses: anthropics/claude-code-security-reviewer@main"
               echo "    with:"
               echo "      claude-api-key: \$\{{ secrets.ANTHROPIC_API_KEY }}"
+              echo "A Claude Code OAuth token works too, via the claude-code-oauth-token"
+              echo "input or the CLAUDE_CODE_OAUTH_TOKEN environment variable. It runs the"
+              echo "audit but cannot authenticate the Anthropic API, so LLM-based false"
+              echo "positive filtering is skipped."
               exit 1
+            fi
+            if [ -z "$ANTHROPIC_API_KEY" ]; then
+              echo "::warning::Authenticating with CLAUDE_CODE_OAUTH_TOKEN. LLM-based false positive filtering is disabled; set claude-api-key to enable it."
             fi
             ;;
           spark)
@@ -306,6 +320,7 @@ runs:
         else
           echo "Claude CLI version: $(claude --version 2>&1 || echo 'Claude CLI not found')"
           echo "ANTHROPIC_API_KEY set: $(if [ -n "$ANTHROPIC_API_KEY" ]; then echo 'Yes'; else echo 'No'; fi)"
+          echo "CLAUDE_CODE_OAUTH_TOKEN set: $(if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then echo 'Yes'; else echo 'No'; fi)"
         fi
         echo "GITHUB_REPOSITORY: $GITHUB_REPOSITORY"
         echo "PR_NUMBER: $PR_NUMBER"

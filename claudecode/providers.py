@@ -92,9 +92,19 @@ class AnthropicProvider:
         import os
 
         from claudecode.claude_api_client import ClaudeAPIClient
+        from claudecode.logger import get_logger
 
         api_key = os.environ.get('ANTHROPIC_API_KEY')
         if not api_key:
+            # A subscription OAuth token authenticates Claude Code but is rejected by the
+            # Messages API, so filtering falls back to hard rules. Say so: silently
+            # skipping it would look like the filter simply found nothing to exclude.
+            if os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'):
+                get_logger(__name__).warning(
+                    'CLAUDE_CODE_OAUTH_TOKEN authenticates Claude Code but not the '
+                    'Anthropic API, so LLM-based false positive filtering is disabled. '
+                    'Set ANTHROPIC_API_KEY to enable it.'
+                )
             return None
         return ClaudeAPIClient(api_key=api_key)
 
