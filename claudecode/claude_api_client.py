@@ -11,6 +11,7 @@ from claudecode.constants import (
 from claudecode import filter_prompts
 from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.logger import get_logger
+from claudecode.stats import UsageStats
 
 logger = get_logger(__name__)
 
@@ -34,6 +35,7 @@ class ClaudeAPIClient:
         self.model = model or DEFAULT_CLAUDE_MODEL
         self.timeout_seconds = timeout_seconds or DEFAULT_TIMEOUT_SECONDS
         self.max_retries = max_retries or DEFAULT_MAX_RETRIES
+        self.usage = UsageStats()
         
         # Get API key from environment or parameter
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -111,6 +113,14 @@ class ClaudeAPIClient:
                 response = self.client.messages.create(**api_params)
                 duration = time.time() - start_time
                 
+                usage = getattr(response, 'usage', None)
+                if usage is not None:
+                    self.usage.record(
+                        input_tokens=getattr(usage, 'input_tokens', 0),
+                        output_tokens=getattr(usage, 'output_tokens', 0),
+                        cached_input_tokens=getattr(usage, 'cache_read_input_tokens', 0),
+                    )
+
                 # Extract text from response
                 response_text = ""
                 for content_block in response.content:

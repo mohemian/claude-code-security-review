@@ -26,6 +26,7 @@ from claudecode.constants import (
     SUBPROCESS_TIMEOUT
 )
 from claudecode.logger import get_logger
+from claudecode.stats import UsageStats
 
 logger = get_logger(__name__)
 
@@ -199,6 +200,7 @@ class SimpleClaudeRunner:
             self.timeout_seconds = timeout_minutes * 60
         else:
             self.timeout_seconds = SUBPROCESS_TIMEOUT
+        self.usage = UsageStats()
     
     def run_security_audit(self, repo_dir: Path, prompt: str) -> Tuple[bool, str, Dict[str, Any]]:
         """Run Claude Code security audit.
@@ -270,6 +272,8 @@ class SimpleClaudeRunner:
                         attempt == 0):
                         continue  # Retry
                     
+                    self._record_usage(parsed_result)
+
                     # Extract security findings
                     parsed_results = self._extract_security_findings(parsed_result)
                     return True, "", parsed_results
@@ -286,6 +290,19 @@ class SimpleClaudeRunner:
         except Exception as e:
             return False, f"Claude Code execution error: {str(e)}", {}
     
+    def _record_usage(self, claude_output: Any) -> None:
+        """Record token usage and cost from a Claude Code result envelope."""
+        if not isinstance(claude_output, dict):
+            return
+        usage = claude_output.get('usage')
+        usage = usage if isinstance(usage, dict) else {}
+        self.usage.record(
+            input_tokens=usage.get('input_tokens'),
+            output_tokens=usage.get('output_tokens'),
+            cached_input_tokens=usage.get('cache_read_input_tokens'),
+            cost_usd=claude_output.get('total_cost_usd'),
+        )
+
     def _extract_security_findings(self, claude_output: Any) -> Dict[str, Any]:
         """Extract security findings from Claude's JSON response."""
         if isinstance(claude_output, dict):
@@ -566,8 +583,45 @@ def _is_finding_in_excluded_directory(finding: Dict[str, Any], github_client: Gi
     return github_client._is_excluded(file_path)
 
 
+def build_run_stats(provider: Any, started_at: float, audit_seconds: float,
+                    filter_seconds: float, findings_raw: int, findings_kept: int,
+                    findings_excluded: int) -> Dict[str, Any]:
+    """Assemble the run summary the GitHub Action renders as a table.
+
+    Kept provider-agnostic: a provider that cannot report a figure (a local vLLM has no
+    cost, for instance) leaves it null rather than reporting a misleading zero.
+    """
+    stats = {
+        'provider': getattr(provider, 'name', 'unknown'),
+        'model': getattr(provider, 'model', '') or 'unknown',
+        'duration_seconds': {
+            'total': round(time.time() - started_at, 1),
+            'security_audit': round(audit_seconds, 1),
+            'false_positive_filtering': round(filter_seconds, 1),
+        },
+        'findings': {
+            'reported_by_model': findings_raw,
+            'kept': findings_kept,
+            'excluded': findings_excluded,
+        },
+    }
+    # Stats are decoration. A completed review must never be lost because its summary
+    # could not be assembled, so anything unexpected here is logged and dropped.
+    try:
+        usage = getattr(provider, 'usage', None)
+        usage_stats = usage.as_dict() if usage is not None else None
+        if isinstance(usage_stats, dict):
+            stats.update(usage_stats)
+        else:
+            logger.warning(f'{stats["provider"]} provider reported no usage figures')
+    except Exception as e:
+        logger.warning(f'Could not collect usage stats: {e}')
+    return stats
+
+
 def main():
     """Main execution function for GitHub Action."""
+    run_started = time.time()
     try:
         # Get environment configuration
         try:
@@ -634,6 +688,7 @@ def main():
         # Get repo directory from environment or use current directory
         repo_path = os.environ.get('REPO_PATH')
         repo_dir = Path(repo_path) if repo_path else Path.cwd()
+        audit_started = time.time()
         success, error_msg, results = provider.run_security_audit(repo_dir, prompt)
         
         # If prompt is too long, retry with a smaller one
@@ -653,6 +708,8 @@ def main():
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))
             sys.exit(EXIT_GENERAL_ERROR)
         
+        audit_seconds = time.time() - audit_started
+        
         # Filter findings to reduce false positives
         original_findings = results.get('findings', [])
         
@@ -665,9 +722,11 @@ def main():
         }
         
         # Apply findings filter (including final directory exclusion)
+        filter_started = time.time()
         kept_findings, excluded_findings, analysis_summary = apply_findings_filter(
             findings_filter, original_findings, pr_context, github_client
         )
+        filter_seconds = time.time() - filter_started
         
         # Prepare output
         output = {
@@ -676,6 +735,15 @@ def main():
             'provider': provider.name,
             'findings': kept_findings,
             'analysis_summary': results.get('analysis_summary', {}),
+            'run_stats': build_run_stats(
+                provider=provider,
+                started_at=run_started,
+                audit_seconds=audit_seconds,
+                filter_seconds=filter_seconds,
+                findings_raw=len(original_findings),
+                findings_kept=len(kept_findings),
+                findings_excluded=len(excluded_findings),
+            ),
             'filtering_summary': {
                 'total_original_findings': len(original_findings),
                 'excluded_findings': len(excluded_findings),

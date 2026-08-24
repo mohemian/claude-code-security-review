@@ -21,6 +21,7 @@ import requests
 from claudecode import filter_prompts
 from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.logger import get_logger
+from claudecode.stats import UsageStats
 from claudecode import prompts
 
 logger = get_logger(__name__)
@@ -79,6 +80,8 @@ class VLLMClient:
         self.timeout_seconds = timeout_seconds or DEFAULT_REQUEST_TIMEOUT
         self.max_retries = max_retries
         self.max_tokens = max_tokens or DEFAULT_MAX_TOKENS
+        # Shared by the audit and the filtering calls, which use the same client.
+        self.usage = UsageStats()
         # None leaves the served model's own default alone.
         self.enable_thinking = enable_thinking
         # Set to False after the server rejects `response_format`.
@@ -191,6 +194,14 @@ class VLLMClient:
                 data = response.json()
             except ValueError:
                 return False, '', f'vLLM returned non-JSON body: {response.text[:300]}'
+
+            usage = data.get('usage') if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                # vLLM is local, so there is no cost to report -- leave it unset.
+                self.usage.record(
+                    input_tokens=usage.get('prompt_tokens'),
+                    output_tokens=usage.get('completion_tokens'),
+                )
 
             success, content, error = _extract_content(data, max_tokens)
             if success:
@@ -380,6 +391,14 @@ class SparkProvider:
 
     def __init__(self, client: Optional[VLLMClient] = None):
         self.client = client or VLLMClient.from_env()
+
+    @property
+    def model(self) -> str:
+        return self.client.model
+
+    @property
+    def usage(self) -> UsageStats:
+        return self.client.usage
 
     def validate(self) -> Tuple[bool, str]:
         return self.client.validate()

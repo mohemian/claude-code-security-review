@@ -183,6 +183,37 @@ This action is not hardened against prompt injection attacks and should only be 
 | `vllm-model` | Model served by vLLM; overrides `VLLM_MODEL` | None | Yes for `provider: spark` (or set `VLLM_MODEL`) |
 | `vllm-api-key` | Bearer token for the vLLM endpoint; overrides `VLLM_API_KEY` | None | No |
 
+### Run summary
+
+At the end of every run the action writes a table to the GitHub Actions **job summary**
+(the run's landing page — no need to open the logs):
+
+| Metric | Value |
+|---|---|
+| Provider | `spark` |
+| Model | `unsloth/Qwen3.8-27B-NVFP4` |
+| Duration (total) | 1m 14s |
+| — security audit | 46s |
+| — false-positive filtering | 26s |
+| LLM calls | 4 |
+| Input tokens | 7,441 |
+| Output tokens | 991 |
+| Cached input tokens | 0 |
+| Total tokens | 8,432 |
+| Cost | not reported |
+| Findings reported by model | 3 |
+| Findings after filtering | **3** |
+| Findings excluded | 0 |
+
+The same figures are in the results JSON under `run_stats`, so they can be consumed by
+later workflow steps.
+
+Cost shows **not reported** rather than `$0.00` for providers that do not price their
+calls — a self-hosted vLLM has no per-call cost, and printing zero would be a claim rather
+than an absence. Only Claude Code reports a real figure (`total_cost_usd`).
+
+If the scan fails, the summary shows the error instead of the table.
+
 ### Action Outputs
 
 | Output | Description |

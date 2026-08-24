@@ -363,3 +363,70 @@ class TestClaudeCodeOAuthToken:
         assert client is None
         assert findings_filter.use_claude_filtering is False
         assert any('not the Anthropic API' in r.message for r in caplog.records)
+
+
+class TestRunStats:
+    """The run summary the action renders as a table."""
+
+    def make_provider(self, **usage):
+        from claudecode.stats import UsageStats
+        provider = Mock()
+        provider.name = 'spark'
+        provider.model = 'Qwen3-32B'
+        provider.usage = UsageStats(**usage)
+        return provider
+
+    def test_shape(self):
+        from claudecode.github_action_audit import build_run_stats
+        import time
+
+        stats = build_run_stats(
+            provider=self.make_provider(calls=4, input_tokens=7441, output_tokens=991),
+            started_at=time.time() - 74.0, audit_seconds=46.3, filter_seconds=25.6,
+            findings_raw=3, findings_kept=2, findings_excluded=1,
+        )
+        assert stats['provider'] == 'spark'
+        assert stats['model'] == 'Qwen3-32B'
+        assert stats['llm_calls'] == 4
+        assert stats['total_tokens'] == 8432
+        assert stats['findings'] == {'reported_by_model': 3, 'kept': 2, 'excluded': 1}
+        assert stats['duration_seconds']['security_audit'] == 46.3
+        assert 73 <= stats['duration_seconds']['total'] <= 76
+
+    def test_unreported_cost_is_null_not_zero(self):
+        """A local GPU has no cost; rendering $0.00 would be a false claim."""
+        from claudecode.github_action_audit import build_run_stats
+        import time
+
+        stats = build_run_stats(self.make_provider(calls=1), time.time(), 1.0, 1.0, 0, 0, 0)
+        assert stats['cost_usd'] is None
+
+    def test_broken_usage_never_loses_a_completed_review(self):
+        """Stats are decoration -- assembling them must not raise."""
+        from claudecode.github_action_audit import build_run_stats
+        import time
+
+        provider = Mock()
+        provider.name = 'spark'
+        provider.model = 'Qwen3-32B'
+        provider.usage.as_dict.side_effect = RuntimeError('boom')
+
+        stats = build_run_stats(provider, time.time(), 1.0, 1.0, 3, 3, 0)
+        assert stats['findings']['kept'] == 3, 'findings must survive a stats failure'
+        assert 'llm_calls' not in stats
+
+    def test_usage_merges_audit_and_filtering(self):
+        from claudecode.stats import UsageStats
+
+        audit = UsageStats(calls=1, input_tokens=40000, output_tokens=500, cost_usd=0.19)
+        filtering = UsageStats(calls=3, input_tokens=9000, output_tokens=300)
+        merged = audit.merge(filtering)
+        assert merged.calls == 4
+        assert merged.input_tokens == 49000
+        assert merged.cost_usd == 0.19
+
+    def test_merging_two_costless_providers_keeps_cost_unreported(self):
+        from claudecode.stats import UsageStats
+
+        merged = UsageStats(calls=1).merge(UsageStats(calls=1))
+        assert merged.cost_usd is None

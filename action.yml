@@ -401,6 +401,57 @@ runs:
         echo "::endgroup::"
     
     
+    - name: Write run summary
+      if: always() && steps.claudecode-check.outputs.enable_claudecode == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        FINDINGS_COUNT: ${{ steps.claudecode-scan.outputs.findings_count }}
+      run: |
+        RESULTS="${{ github.workspace }}/claudecode-results.json"
+        {
+          echo "## Security review"
+          echo
+          if [ ! -s "$RESULTS" ]; then
+            echo "The scan produced no results file."
+            exit 0
+          fi
+          if jq -e '.error' "$RESULTS" >/dev/null 2>&1; then
+            echo "The scan did not complete:"
+            echo
+            echo '```'
+            jq -r '.error' "$RESULTS"
+            echo '```'
+            exit 0
+          fi
+          jq -r '
+            def n: if . == null then "n/a" else (. | tostring) end;
+            def commas: if . == null then "n/a" else
+              (tostring | explode | reverse | to_entries
+               | map(if .key > 0 and .key % 3 == 0 then [44, .value] else [.value] end)
+               | flatten | reverse | implode) end;
+            def dur: if . == null then "n/a"
+              elif . < 60 then "\(. | round)s"
+              else "\((. / 60 | floor))m \((. % 60 | round))s" end;
+            .run_stats as $s |
+            "| Metric | Value |",
+            "|---|---|",
+            "| Provider | `\($s.provider | n)` |",
+            "| Model | `\($s.model | n)` |",
+            "| Duration (total) | \($s.duration_seconds.total | dur) |",
+            "| — security audit | \($s.duration_seconds.security_audit | dur) |",
+            "| — false-positive filtering | \($s.duration_seconds.false_positive_filtering | dur) |",
+            "| LLM calls | \($s.llm_calls | n) |",
+            "| Input tokens | \($s.input_tokens | commas) |",
+            "| Output tokens | \($s.output_tokens | commas) |",
+            "| Cached input tokens | \($s.cached_input_tokens | commas) |",
+            "| Total tokens | \($s.total_tokens | commas) |",
+            "| Cost | \(if $s.cost_usd == null then "not reported" else "$\($s.cost_usd * 100 | round / 100)" end) |",
+            "| Findings reported by model | \($s.findings.reported_by_model | n) |",
+            "| Findings after filtering | **\($s.findings.kept | n)** |",
+            "| Findings excluded | \($s.findings.excluded | n) |"
+          ' "$RESULTS" 2>/dev/null || echo "Run statistics were not available."
+        } >> "$GITHUB_STEP_SUMMARY"
+
     - name: Upload scan results
       if: always() && inputs.upload-results == 'true'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 pinned to commit hash

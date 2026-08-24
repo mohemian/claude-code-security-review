@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover
         return cls
 
 from claudecode import prompts
+from claudecode.stats import UsageStats
 
 SUPPORTED_PROVIDERS = ('anthropic', 'spark')
 DEFAULT_PROVIDER = 'anthropic'
@@ -36,6 +37,11 @@ class SecurityReviewProvider(Protocol):
 
     name: str
     display_name: str
+    model: str
+
+    @property
+    def usage(self) -> UsageStats:
+        """Token and cost totals across every LLM call this provider made."""
 
     def validate(self) -> Tuple[bool, str]:
         """Check the provider is usable. Returns (ok, error_message)."""
@@ -74,6 +80,20 @@ class AnthropicProvider:
         from claudecode import github_action_audit
 
         self.runner = github_action_audit.SimpleClaudeRunner(timeout_minutes)
+        self._filter_client = None
+
+    @property
+    def model(self) -> str:
+        from claudecode.constants import DEFAULT_CLAUDE_MODEL
+
+        return DEFAULT_CLAUDE_MODEL
+
+    @property
+    def usage(self) -> UsageStats:
+        """Claude Code plus, if it was used, the Messages API filtering calls."""
+        if self._filter_client is None:
+            return self.runner.usage
+        return self.runner.usage.merge(self._filter_client.usage)
 
     def validate(self) -> Tuple[bool, str]:
         return self.runner.validate_claude_available()
@@ -106,7 +126,8 @@ class AnthropicProvider:
                     'Set ANTHROPIC_API_KEY to enable it.'
                 )
             return None
-        return ClaudeAPIClient(api_key=api_key)
+        self._filter_client = ClaudeAPIClient(api_key=api_key)
+        return self._filter_client
 
 
 def create_provider(provider_name: Optional[str] = None,
