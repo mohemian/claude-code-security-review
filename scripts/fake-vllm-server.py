@@ -94,10 +94,16 @@ class Handler(BaseHTTPRequestHandler):
                 finding['line'] = changed_line
             content = json.dumps(body)
 
+        # Rough but non-zero, so the run-summary table is exercised with real numbers.
+        prompt_tokens = max(1, len(prompt) // 4)
+        completion_tokens = max(1, len(content) // 4)
         self._send(200, json.dumps({
             'model': request.get('model'),
             'choices': [{'index': 0, 'finish_reason': 'stop',
                          'message': {'role': 'assistant', 'content': content}}],
+            'usage': {'prompt_tokens': prompt_tokens,
+                      'completion_tokens': completion_tokens,
+                      'total_tokens': prompt_tokens + completion_tokens},
         }))
 
     def do_GET(self):
