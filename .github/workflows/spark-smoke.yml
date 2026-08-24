@@ -28,9 +28,7 @@ jobs:
         run: |
           python3 -u scripts/fake-vllm-server.py --port 8000 --mode findings > vllm.log 2>&1 &
           for _ in $(seq 1 20); do
-            if curl -sf -o /dev/null -X POST http://localhost:8000/v1/chat/completions \
-                 -H 'Content-Type: application/json' \
-                 -d '{"model":"probe","messages":[{"role":"user","content":"probe"}]}'; then
+            if curl -sf -o /dev/null http://localhost:8000/health; then
               echo "fake vLLM is up"
               exit 0
             fi
@@ -38,7 +36,8 @@ jobs:
           done
           echo "fake vLLM did not start"; cat vllm.log; exit 1
 
-      - uses: ./ # Points directly to action.yml
+      - id: review
+        uses: ./ # Points directly to action.yml
         with:
           provider: spark
           comment-pr: true
@@ -68,7 +67,14 @@ jobs:
             echo "::error::VLLM_MODEL was not passed through to vLLM"
             exit 1
           fi
-          echo "audit + filtering both reached vLLM with the configured model"
+          # The action must have produced the finding the fake model reported. Without
+          # this the job passes even when the audit fails, which it did on the first run.
+          if [ "${{ steps.review.outputs.findings-count }}" != "1" ]; then
+            echo "::error::expected 1 finding, got '${{ steps.review.outputs.findings-count }}'"
+            echo "::error::the audit or the filtering step did not complete"
+            exit 1
+          fi
+          echo "audit + filtering both reached vLLM, and one finding survived filtering"
 
       - name: Check no Claude Code was installed
         if: always()

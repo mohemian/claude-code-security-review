@@ -7,6 +7,7 @@ for a filtering prompt.
 
     python3 scripts/fake-vllm-server.py --port 8000
     # then point the action at http://localhost:8000/v1
+    # readiness: curl -sf http://localhost:8000/health
 
 Modes (--mode) let you rehearse the failure paths:
     findings   valid report with one HIGH finding (default)
@@ -62,7 +63,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers['Content-Length'])) or b'{}')
         prompt = request['messages'][-1]['content']
-        is_filter = 'Finding to analyze' in prompt
+        # Classify on the system prompt, which the action authors. Keying off the user
+        # prompt would let the repository under review flip the branch just by containing
+        # the marker string -- which is exactly what happened on the first run.
+        system = request['messages'][0]['content'] if request.get('messages') else ''
+        is_filter = 'reviewing findings from an automated code audit' in system
         Handler.calls += 1
 
         print(f'  -> {self.path} call={Handler.calls} model={request.get("model")!r} '
@@ -94,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
             'choices': [{'index': 0, 'finish_reason': 'stop',
                          'message': {'role': 'assistant', 'content': content}}],
         }))
+
+    def do_GET(self):
+        """Readiness probe. Kept off the completions path so it cannot skew the log."""
+        self._send(200 if self.path == '/health' else 404, '{}')
 
     def log_message(self, *args):
         pass  # the do_POST print above is the log we want
