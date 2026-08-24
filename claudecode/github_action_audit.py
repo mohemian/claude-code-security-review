@@ -15,7 +15,7 @@ import re
 import time 
 
 # Import existing components we can reuse
-from claudecode.prompts import get_security_audit_prompt
+from claudecode.providers import DEFAULT_PROVIDER, SUPPORTED_PROVIDERS, create_provider
 from claudecode.findings_filter import FindingsFilter
 from claudecode.json_parser import parse_json_with_fallbacks
 from claudecode.constants import (
@@ -26,6 +26,7 @@ from claudecode.constants import (
     SUBPROCESS_TIMEOUT
 )
 from claudecode.logger import get_logger
+from claudecode.stats import UsageStats
 
 logger = get_logger(__name__)
 
@@ -199,6 +200,7 @@ class SimpleClaudeRunner:
             self.timeout_seconds = timeout_minutes * 60
         else:
             self.timeout_seconds = SUBPROCESS_TIMEOUT
+        self.usage = UsageStats()
     
     def run_security_audit(self, repo_dir: Path, prompt: str) -> Tuple[bool, str, Dict[str, Any]]:
         """Run Claude Code security audit.
@@ -270,6 +272,8 @@ class SimpleClaudeRunner:
                         attempt == 0):
                         continue  # Retry
                     
+                    self._record_usage(parsed_result)
+
                     # Extract security findings
                     parsed_results = self._extract_security_findings(parsed_result)
                     return True, "", parsed_results
@@ -286,6 +290,19 @@ class SimpleClaudeRunner:
         except Exception as e:
             return False, f"Claude Code execution error: {str(e)}", {}
     
+    def _record_usage(self, claude_output: Any) -> None:
+        """Record token usage and cost from a Claude Code result envelope."""
+        if not isinstance(claude_output, dict):
+            return
+        usage = claude_output.get('usage')
+        usage = usage if isinstance(usage, dict) else {}
+        self.usage.record(
+            input_tokens=usage.get('input_tokens'),
+            output_tokens=usage.get('output_tokens'),
+            cached_input_tokens=usage.get('cache_read_input_tokens'),
+            cost_usd=claude_output.get('total_cost_usd'),
+        )
+
     def _extract_security_findings(self, claude_output: Any) -> Dict[str, Any]:
         """Extract security findings from Claude's JSON response."""
         if isinstance(claude_output, dict):
@@ -323,10 +340,13 @@ class SimpleClaudeRunner:
             )
             
             if result.returncode == 0:
-                # Also check if API key is configured
-                api_key = os.environ.get('ANTHROPIC_API_KEY', '')
-                if not api_key:
-                    return False, "ANTHROPIC_API_KEY environment variable is not set"
+                # Either credential authenticates Claude Code: an API key, or a
+                # subscription OAuth token (see the Claude Code GitHub Actions docs).
+                credential = (os.environ.get('ANTHROPIC_API_KEY', '')
+                              or os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', ''))
+                if not credential:
+                    return False, ("ANTHROPIC_API_KEY environment variable is not set "
+                                   "(CLAUDE_CODE_OAUTH_TOKEN also works)")
                 return True, ""
             else:
                 error_msg = f"Claude Code returned exit code {result.returncode}"
@@ -372,11 +392,32 @@ def get_environment_config() -> Tuple[str, int]:
     return repo_name, pr_number
 
 
-def initialize_clients() -> Tuple[GitHubActionClient, SimpleClaudeRunner]:
-    """Initialize GitHub and Claude clients.
+def get_provider_name() -> str:
+    """Get and validate the configured LLM provider name.
     
     Returns:
-        Tuple of (github_client, claude_runner)
+        A provider name from SUPPORTED_PROVIDERS
+        
+    Raises:
+        ConfigurationError: If the configured provider is not supported
+    """
+    name = (os.environ.get('LLM_PROVIDER') or DEFAULT_PROVIDER).strip().lower()
+    if name not in SUPPORTED_PROVIDERS:
+        raise ConfigurationError(
+            f"Unsupported provider: {os.environ.get('LLM_PROVIDER')!r}. "
+            f"Supported providers: {', '.join(SUPPORTED_PROVIDERS)}"
+        )
+    return name
+
+
+def initialize_clients(provider_name: Optional[str] = None) -> Tuple[GitHubActionClient, Any]:
+    """Initialize the GitHub client and the LLM provider.
+    
+    Args:
+        provider_name: Provider to use; defaults to `anthropic`
+        
+    Returns:
+        Tuple of (github_client, provider)
         
     Raises:
         ConfigurationError: If client initialization fails
@@ -386,19 +427,26 @@ def initialize_clients() -> Tuple[GitHubActionClient, SimpleClaudeRunner]:
     except Exception as e:
         raise ConfigurationError(f'Failed to initialize GitHub client: {str(e)}')
     
+    name = provider_name or DEFAULT_PROVIDER
     try:
-        claude_runner = SimpleClaudeRunner()
+        provider = create_provider(name)
+    except ValueError as e:
+        raise ConfigurationError(str(e))
     except Exception as e:
-        raise ConfigurationError(f'Failed to initialize Claude runner: {str(e)}')
+        label = 'Claude runner' if name == DEFAULT_PROVIDER else f'{name} provider'
+        raise ConfigurationError(f'Failed to initialize {label}: {str(e)}')
         
-    return github_client, claude_runner
+    return github_client, provider
 
 
-def initialize_findings_filter(custom_filtering_instructions: Optional[str] = None) -> FindingsFilter:
+def initialize_findings_filter(custom_filtering_instructions: Optional[str] = None,
+                               provider: Optional[Any] = None) -> FindingsFilter:
     """Initialize findings filter based on environment configuration.
     
     Args:
         custom_filtering_instructions: Optional custom filtering instructions
+        provider: LLM provider supplying the filtering client. When omitted the legacy
+            Anthropic-from-environment behaviour is used.
         
     Returns:
         FindingsFilter instance
@@ -407,8 +455,25 @@ def initialize_findings_filter(custom_filtering_instructions: Optional[str] = No
         ConfigurationError: If filter initialization fails
     """
     try:
-        # Check if we should use Claude API filtering
+        # Check if we should use LLM-based filtering
         use_claude_filtering = os.environ.get('ENABLE_CLAUDE_FILTERING', 'false').lower() == 'true'
+        
+        if provider is not None:
+            # Provider-owned filtering: no ANTHROPIC_API_KEY lookup on non-Anthropic paths.
+            client = provider.create_filter_client() if use_claude_filtering else None
+            if client is None:
+                logger.info('LLM-based false positive filtering disabled; using hard rules only')
+                return FindingsFilter(
+                    use_hard_exclusions=True,
+                    use_claude_filtering=False
+                )
+            return FindingsFilter(
+                use_hard_exclusions=True,
+                use_claude_filtering=True,
+                client=client,
+                custom_filtering_instructions=custom_filtering_instructions
+            )
+        
         api_key = os.environ.get('ANTHROPIC_API_KEY')
         
         if use_claude_filtering and api_key:
@@ -518,12 +583,50 @@ def _is_finding_in_excluded_directory(finding: Dict[str, Any], github_client: Gi
     return github_client._is_excluded(file_path)
 
 
+def build_run_stats(provider: Any, started_at: float, audit_seconds: float,
+                    filter_seconds: float, findings_raw: int, findings_kept: int,
+                    findings_excluded: int) -> Dict[str, Any]:
+    """Assemble the run summary the GitHub Action renders as a table.
+
+    Kept provider-agnostic: a provider that cannot report a figure (a local vLLM has no
+    cost, for instance) leaves it null rather than reporting a misleading zero.
+    """
+    stats = {
+        'provider': getattr(provider, 'name', 'unknown'),
+        'model': getattr(provider, 'model', '') or 'unknown',
+        'duration_seconds': {
+            'total': round(time.time() - started_at, 1),
+            'security_audit': round(audit_seconds, 1),
+            'false_positive_filtering': round(filter_seconds, 1),
+        },
+        'findings': {
+            'reported_by_model': findings_raw,
+            'kept': findings_kept,
+            'excluded': findings_excluded,
+        },
+    }
+    # Stats are decoration. A completed review must never be lost because its summary
+    # could not be assembled, so anything unexpected here is logged and dropped.
+    try:
+        usage = getattr(provider, 'usage', None)
+        usage_stats = usage.as_dict() if usage is not None else None
+        if isinstance(usage_stats, dict):
+            stats.update(usage_stats)
+        else:
+            logger.warning(f'{stats["provider"]} provider reported no usage figures')
+    except Exception as e:
+        logger.warning(f'Could not collect usage stats: {e}')
+    return stats
+
+
 def main():
     """Main execution function for GitHub Action."""
+    run_started = time.time()
     try:
         # Get environment configuration
         try:
             repo_name, pr_number = get_environment_config()
+            provider_name = get_provider_name()
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
@@ -552,22 +655,22 @@ def main():
         
         # Initialize components
         try:
-            github_client, claude_runner = initialize_clients()
+            github_client, provider = initialize_clients(provider_name)
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
             
         # Initialize findings filter
         try:
-            findings_filter = initialize_findings_filter(custom_filtering_instructions)
+            findings_filter = initialize_findings_filter(custom_filtering_instructions, provider)
         except ConfigurationError as e:
             print(json.dumps({'error': str(e)}))
             sys.exit(EXIT_CONFIGURATION_ERROR)
         
-        # Validate Claude Code is available
-        claude_ok, claude_error = claude_runner.validate_claude_available()
-        if not claude_ok:
-            print(json.dumps({'error': f'Claude Code not available: {claude_error}'}))
+        # Validate the provider is configured and usable
+        provider_ok, provider_error = provider.validate()
+        if not provider_ok:
+            print(json.dumps({'error': f'{provider.display_name} not available: {provider_error}'}))
             sys.exit(EXIT_GENERAL_ERROR)
         
         # Get PR data
@@ -579,24 +682,33 @@ def main():
             sys.exit(EXIT_GENERAL_ERROR)
                 
         # Generate security audit prompt
-        prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
+        prompt = provider.build_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
         
-        # Run Claude Code security audit
+        # Run the security audit
         # Get repo directory from environment or use current directory
         repo_path = os.environ.get('REPO_PATH')
         repo_dir = Path(repo_path) if repo_path else Path.cwd()
-        success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt)
+        audit_started = time.time()
+        success, error_msg, results = provider.run_security_audit(repo_dir, prompt)
         
-        # If prompt is too long, retry without diff
+        # If prompt is too long, retry with a smaller one
         if not success and error_msg == "PROMPT_TOO_LONG":
-            print(f"[Info] Prompt too long, retrying without diff. Original prompt length: {len(prompt)} characters", file=sys.stderr)
-            prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
+            print(f"[Info] Prompt too long, retrying with a reduced prompt. Original prompt length: {len(prompt)} characters", file=sys.stderr)
+            prompt_without_diff = provider.build_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
             print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
-            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
+            success, error_msg, results = provider.run_security_audit(repo_dir, prompt_without_diff)
+            if not success and error_msg == "PROMPT_TOO_LONG":
+                error_msg = (
+                    'the PR is too large for the model context window, even after reducing '
+                    'the diff. Exclude directories with `exclude-directories`, or use a '
+                    'model with a larger context window.'
+                )
         
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))
             sys.exit(EXIT_GENERAL_ERROR)
+        
+        audit_seconds = time.time() - audit_started
         
         # Filter findings to reduce false positives
         original_findings = results.get('findings', [])
@@ -610,16 +722,28 @@ def main():
         }
         
         # Apply findings filter (including final directory exclusion)
+        filter_started = time.time()
         kept_findings, excluded_findings, analysis_summary = apply_findings_filter(
             findings_filter, original_findings, pr_context, github_client
         )
+        filter_seconds = time.time() - filter_started
         
         # Prepare output
         output = {
             'pr_number': pr_number,
             'repo': repo_name,
+            'provider': provider.name,
             'findings': kept_findings,
             'analysis_summary': results.get('analysis_summary', {}),
+            'run_stats': build_run_stats(
+                provider=provider,
+                started_at=run_started,
+                audit_seconds=audit_seconds,
+                filter_seconds=filter_seconds,
+                findings_raw=len(original_findings),
+                findings_kept=len(kept_findings),
+                findings_excluded=len(excluded_findings),
+            ),
             'filtering_summary': {
                 'total_original_findings': len(original_findings),
                 'excluded_findings': len(excluded_findings),

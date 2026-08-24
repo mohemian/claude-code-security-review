@@ -1,6 +1,7 @@
 """Security audit prompt templates."""
 
-def get_security_audit_prompt(pr_data, pr_diff=None, include_diff=True, custom_scan_instructions=None):
+def get_security_audit_prompt(pr_data, pr_diff=None, include_diff=True, custom_scan_instructions=None,
+                              agentic=True):
     """Generate security audit prompt for Claude Code.
     
     Args:
@@ -8,6 +9,9 @@ def get_security_audit_prompt(pr_data, pr_diff=None, include_diff=True, custom_s
         pr_diff: Optional complete PR diff in unified format
         include_diff: Whether to include the diff in the prompt (default: True)
         custom_scan_instructions: Optional custom security categories to append
+        agentic: Whether the model can explore the repository with tools. Claude Code can
+            (default). Providers that issue a single stateless completion pass False, which
+            swaps the tool-usage instructions for context-only ones.
         
     Returns:
         Formatted prompt string
@@ -28,9 +32,17 @@ PR DIFF CONTENT:
 Review the complete diff above. This contains all code changes in the PR.
 """
     elif pr_diff and not include_diff:
-        diff_section = """
+        if agentic:
+            diff_section = """
 
 NOTE: PR diff was omitted due to size constraints. Please use the file exploration tools to examine the specific files that were changed in this PR.
+"""
+        else:
+            diff_section = """
+
+NOTE: The PR diff was omitted due to size constraints and you have no way to retrieve it.
+Report findings ONLY if the file list above is sufficient to establish them with high confidence.
+If it is not, return an empty findings list rather than speculating.
 """
     
     # Add custom security categories if provided
@@ -38,6 +50,25 @@ NOTE: PR diff was omitted due to size constraints. Please use the file explorati
     if custom_scan_instructions:
         custom_categories_section = f"\n{custom_scan_instructions}\n"
     
+    if agentic:
+        phase_one = """
+Phase 1 - Repository Context Research (Use file search tools):
+- Identify existing security frameworks and libraries in use
+- Look for established secure coding patterns in the codebase
+- Examine existing sanitization and validation patterns
+- Understand the project's security model and threat model
+"""
+        closing = "Begin your analysis now. Use the repository exploration tools to understand the codebase context, then analyze the PR changes for security implications."
+    else:
+        phase_one = """
+Phase 1 - Context Review (no tools available):
+- You CANNOT browse the repository, run commands, or open files. Everything you may rely on is
+  contained in this prompt.
+- Base every finding strictly on the changed files and diff above.
+- If establishing a vulnerability would require code you cannot see, do not report it.
+"""
+        closing = "Begin your analysis now. Analyze the PR changes above for security implications."
+
     return f"""
 You are a senior security engineer conducting a focused security review of GitHub PR #{pr_data['number']}: "{pr_data['title']}"
 
@@ -104,13 +135,7 @@ Additional notes:
 - Even if something is only exploitable from the local network, it can still be a HIGH severity issue
 
 ANALYSIS METHODOLOGY:
-
-Phase 1 - Repository Context Research (Use file search tools):
-- Identify existing security frameworks and libraries in use
-- Look for established secure coding patterns in the codebase
-- Examine existing sanitization and validation patterns
-- Understand the project's security model and threat model
-
+{phase_one}
 Phase 2 - Comparative Analysis:
 - Compare new code changes against existing security patterns
 - Identify deviations from established secure practices
@@ -170,7 +195,7 @@ IMPORTANT EXCLUSIONS - DO NOT REPORT:
 - Memory consumption or CPU exhaustion issues.
 - Lack of input validation on non-security-critical fields. If there isn't a proven problem from a lack of input validation, don't report it.
 
-Begin your analysis now. Use the repository exploration tools to understand the codebase context, then analyze the PR changes for security implications.
+{closing}
 
 Your final reply must contain the JSON and nothing else. You should not reply again after outputting the JSON.
 """

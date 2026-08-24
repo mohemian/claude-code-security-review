@@ -1,0 +1,131 @@
+name: Spark provider smoke test
+
+# Exercises action.yml end to end on the spark path -- the provider case statements,
+# the conditional installs, the inputs-vs-env fallback and PR commenting -- against
+# scripts/fake-vllm-server.py. No DGX Spark and no secrets required.
+#
+# To run this against the real box instead: change `runs-on` to your self-hosted
+# runner, drop the "Start fake vLLM" step, and point vllm-base-url/vllm-model at it.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  spark-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 pinned to commit hash
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+
+      - name: Start fake vLLM
+        run: |
+          python3 -u scripts/fake-vllm-server.py --port 8000 --mode findings > vllm.log 2>&1 &
+          for _ in $(seq 1 20); do
+            if curl -sf -o /dev/null http://localhost:8000/health; then
+              echo "fake vLLM is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "fake vLLM did not start"; cat vllm.log; exit 1
+
+      - id: review
+        uses: ./ # Points directly to action.yml
+        with:
+          provider: spark
+          comment-pr: true
+          upload-results: true
+          run-every-commit: true
+        env:
+          # Deliberately set through the environment, not inputs: this is the path the
+          # README documents for the DGX Spark, so it is the one worth smoke testing.
+          VLLM_BASE_URL: http://localhost:8000/v1
+          VLLM_MODEL: Qwen3-smoke-test
+
+      - name: Check the model was actually called
+        if: always()
+        run: |
+          echo "::group::fake vLLM log"
+          cat vllm.log
+          echo "::endgroup::"
+          if ! grep -q "kind=audit" vllm.log; then
+            echo "::error::the action never issued a security audit call to vLLM"
+            exit 1
+          fi
+          if ! grep -q "kind=filter" vllm.log; then
+            echo "::error::the action never issued a false-positive filtering call to vLLM"
+            exit 1
+          fi
+          if ! grep -q "model='Qwen3-smoke-test'" vllm.log; then
+            echo "::error::VLLM_MODEL was not passed through to vLLM"
+            exit 1
+          fi
+          # The action must have produced the finding the fake model reported. Without
+          # this the job passes even when the audit fails, which it did on the first run.
+          if [ "${{ steps.review.outputs.findings-count }}" != "1" ]; then
+            echo "::error::expected 1 finding, got '${{ steps.review.outputs.findings-count }}'"
+            echo "::error::the audit or the filtering step did not complete"
+            exit 1
+          fi
+          echo "audit + filtering both reached vLLM, and one finding survived filtering"
+
+      - name: Check the run summary table was written
+        if: always()
+        run: |
+          # GITHUB_STEP_SUMMARY is per-step and cannot be read back from here, so the
+          # action also writes the rendered table to the workspace.
+          SUMMARY="${{ github.workspace }}/security-review-summary.md"
+          echo "::group::rendered summary"
+          cat "$SUMMARY"
+          echo "::endgroup::"
+          for row in "| Provider | \`spark\`" "| Model | \`Qwen3-smoke-test\`" \
+                     "| LLM calls |" "| Input tokens |" "| Findings after filtering |"; do
+            if ! grep -qF "$row" "$SUMMARY"; then
+              echo "::error::run summary is missing the row: $row"
+              exit 1
+            fi
+          done
+          # Zeroes here would mean usage was never threaded through from the provider.
+          if grep -qE "^\| (Input|Output|Total) tokens \| (0|n/a) \|$" "$SUMMARY"; then
+            echo "::error::token counts are zero or missing; usage did not reach the summary"
+            exit 1
+          fi
+          if grep -qF "| Cost | \$0" "$SUMMARY"; then
+            echo "::error::a local vLLM has no per-call cost; it must read 'not reported'"
+            exit 1
+          fi
+          echo "run summary table written with real figures"
+
+      - name: Check no Claude Code was installed
+        if: always()
+        run: |
+          if command -v claude >/dev/null 2>&1; then
+            echo "::error::claude CLI is on PATH; provider=spark must not install it"
+            exit 1
+          fi
+          if python3 -c "import anthropic" 2>/dev/null; then
+            echo "::error::the anthropic SDK is installed; provider=spark must not need it"
+            exit 1
+          fi
+          echo "no Claude Code and no Anthropic SDK on the spark path"
+
+      - name: Check an unsupported provider is rejected
+        run: |
+          if python3 -c "
+          import os, sys
+          os.environ['LLM_PROVIDER'] = 'sprak'
+          sys.path.insert(0, '.')
+          from claudecode.github_action_audit import get_provider_name
+          get_provider_name()
+          " 2>/dev/null; then
+            echo "::error::an unsupported provider was accepted"
+            exit 1
+          fi
+          echo "unsupported provider rejected"

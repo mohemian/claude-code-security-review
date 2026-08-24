@@ -126,7 +126,8 @@ class TestMainFunction:
             call_kwargs = mock_full_filter_class.call_args[1]
             assert call_kwargs['use_hard_exclusions'] is True
             assert call_kwargs['use_claude_filtering'] is True
-            assert call_kwargs['api_key'] == 'test-api-key'
+            # The provider now supplies the client instead of a raw API key
+            assert call_kwargs['client'].api_key == 'test-api-key'
         
         # Reset mocks
         mock_full_filter_class.reset_mock()
@@ -177,7 +178,7 @@ class TestMainFunction:
             assert 'Claude Code not available' in output['error']
             assert 'Claude not installed' in output['error']
     
-    @patch('claudecode.github_action_audit.get_security_audit_prompt')
+    @patch('claudecode.prompts.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')
@@ -210,7 +211,7 @@ class TestMainFunction:
             assert 'API error' in output['error']
     
     @patch('pathlib.Path.cwd')
-    @patch('claudecode.github_action_audit.get_security_audit_prompt')
+    @patch('claudecode.prompts.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')
@@ -279,7 +280,7 @@ class TestMainFunction:
             assert output['filtering_summary']['total_original_findings'] == 0
     
     @patch('pathlib.Path.cwd')
-    @patch('claudecode.github_action_audit.get_security_audit_prompt')
+    @patch('claudecode.prompts.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')
@@ -370,7 +371,7 @@ class TestMainFunction:
             assert output['filtering_summary']['kept_findings'] == 1
     
     @patch('pathlib.Path.cwd')
-    @patch('claudecode.github_action_audit.get_security_audit_prompt')
+    @patch('claudecode.prompts.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')
     def test_main_with_full_filter(self, mock_client_class, mock_runner_class,
@@ -432,7 +433,7 @@ class TestMainFunction:
                 assert output['findings'][0]['severity'] == 'HIGH'
     
     @patch('pathlib.Path.cwd')
-    @patch('claudecode.github_action_audit.get_security_audit_prompt')
+    @patch('claudecode.prompts.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')
     def test_main_filter_failure_keeps_all_findings(self, mock_client_class, mock_runner_class,
@@ -516,7 +517,7 @@ class TestAuditFailureModes:
     """Test various audit failure scenarios."""
     
     @patch('pathlib.Path.cwd')
-    @patch('claudecode.github_action_audit.get_security_audit_prompt')
+    @patch('claudecode.prompts.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')

@@ -3,6 +3,11 @@ description: 'AI-powered security review GitHub Action using Claude to analyze c
 author: 'Anthropic'
 
 inputs:
+  provider:
+    description: 'LLM provider to use for the security review (anthropic | spark)'
+    required: false
+    default: 'anthropic'
+
   comment-pr:
     description: 'Whether to comment on PRs with findings'
     required: false
@@ -24,8 +29,13 @@ inputs:
     default: '20'
   
   claude-api-key:
-    description: 'Anthropic Claude API key for security analysis'
-    required: true
+    description: 'Anthropic Claude API key for security analysis (provider: anthropic)'
+    required: false
+    default: ''
+
+  claude-code-oauth-token:
+    description: 'Claude Code OAuth token, as an alternative to claude-api-key (provider: anthropic). Authenticates Claude Code but not the Anthropic API, so LLM-based false positive filtering is skipped. Falls back to the CLAUDE_CODE_OAUTH_TOKEN environment variable.'
+    required: false
     default: ''
 
   claude-model:
@@ -48,6 +58,21 @@ inputs:
     required: false
     default: ''
 
+  vllm-base-url:
+    description: 'OpenAI-compatible vLLM base URL, e.g. http://localhost:8000/v1 (provider: spark). Falls back to the VLLM_BASE_URL environment variable.'
+    required: false
+    default: ''
+
+  vllm-model:
+    description: 'Model name served by vLLM, e.g. Qwen3-32B (provider: spark). Falls back to the VLLM_MODEL environment variable.'
+    required: false
+    default: ''
+
+  vllm-api-key:
+    description: 'Optional bearer token for the vLLM endpoint (provider: spark). Falls back to the VLLM_API_KEY environment variable.'
+    required: false
+    default: ''
+
 outputs:
   findings-count:
     description: 'Number of security findings'
@@ -64,8 +89,12 @@ runs:
       shell: bash
       run: |
         echo "::group::Install gh CLI"
-        # Install GitHub CLI for PR operations
-        sudo apt-get update && sudo apt-get install -y gh
+        # Install GitHub CLI for PR operations (self-hosted runners often ship it already)
+        if command -v gh >/dev/null 2>&1; then
+          echo "gh is already installed: $(gh --version 2>/dev/null | head -n1 || true)"
+        else
+          sudo apt-get update && sudo apt-get install -y gh
+        fi
         echo "::endgroup::"
     
     - name: Set up Python
@@ -155,7 +184,7 @@ runs:
         key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
     
     - name: Set up Node.js
-      if: steps.claudecode-check.outputs.enable_claudecode == 'true'
+      if: steps.claudecode-check.outputs.enable_claudecode == 'true' && inputs.provider != 'spark'
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 pinned to commit hash
       with:
         node-version: '18'
@@ -164,13 +193,27 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        LLM_PROVIDER: ${{ inputs.provider }}
       run: |
         echo "::group::Install Deps"
+        case "$LLM_PROVIDER" in
+          ""|anthropic|spark) ;;
+          *)
+            echo "::error::Unsupported provider: '$LLM_PROVIDER'. Supported providers: anthropic, spark"
+            exit 1
+            ;;
+        esac
         if [ "${{ steps.claudecode-check.outputs.enable_claudecode }}" == "true" ]; then
           pip install -r "$ACTION_PATH/claudecode/requirements.txt"
-          npm install -g @anthropic-ai/claude-code
+          # Claude Code and the Anthropic SDK are only needed by the anthropic provider.
+          if [ "$LLM_PROVIDER" != "spark" ]; then
+            pip install -r "$ACTION_PATH/claudecode/requirements-anthropic.txt"
+            npm install -g @anthropic-ai/claude-code
+          fi
         fi
-        sudo apt-get update && sudo apt-get install -y jq
+        if ! command -v jq >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y jq
+        fi
         echo "::endgroup::"
     
     - name: Run ClaudeCode scan
@@ -182,6 +225,11 @@ runs:
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         ANTHROPIC_API_KEY: ${{ inputs.claude-api-key }}
+        INPUT_CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
+        LLM_PROVIDER: ${{ inputs.provider }}
+        INPUT_VLLM_BASE_URL: ${{ inputs.vllm-base-url }}
+        INPUT_VLLM_MODEL: ${{ inputs.vllm-model }}
+        INPUT_VLLM_API_KEY: ${{ inputs.vllm-api-key }}
         ENABLE_CLAUDE_FILTERING: 'true' 
         EXCLUDE_DIRECTORIES: ${{ inputs.exclude-directories }}
         FALSE_POSITIVE_FILTERING_INSTRUCTIONS: ${{ inputs.false-positive-filtering-instructions }}
@@ -203,15 +251,55 @@ runs:
           exit 0
         fi
         
-        # Validate API key is provided
-        if [ -z "$ANTHROPIC_API_KEY" ]; then
-          echo "::error::ANTHROPIC_API_KEY is not set. Please provide the claude-api-key input to the action."
-          echo "Example usage:"
-          echo "  - uses: anthropics/claude-code-security-reviewer@main"
-          echo "    with:"
-          echo "      claude-api-key: \$\{{ secrets.ANTHROPIC_API_KEY }}"
-          exit 1
-        fi
+        # Action inputs win over inherited environment variables, but either works.
+        export VLLM_BASE_URL="${INPUT_VLLM_BASE_URL:-$VLLM_BASE_URL}"
+        export VLLM_MODEL="${INPUT_VLLM_MODEL:-$VLLM_MODEL}"
+        export VLLM_API_KEY="${INPUT_VLLM_API_KEY:-$VLLM_API_KEY}"
+        export CLAUDE_CODE_OAUTH_TOKEN="${INPUT_CLAUDE_CODE_OAUTH_TOKEN:-$CLAUDE_CODE_OAUTH_TOKEN}"
+        
+        # Provider-specific configuration validation
+        case "$LLM_PROVIDER" in
+          ""|anthropic)
+            export LLM_PROVIDER="anthropic"
+            if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+              echo "::error::ANTHROPIC_API_KEY is not set. Please provide the claude-api-key input to the action."
+              echo "Example usage:"
+              echo "  - uses: anthropics/claude-code-security-reviewer@main"
+              echo "    with:"
+              echo "      claude-api-key: \$\{{ secrets.ANTHROPIC_API_KEY }}"
+              echo "A Claude Code OAuth token works too, via the claude-code-oauth-token"
+              echo "input or the CLAUDE_CODE_OAUTH_TOKEN environment variable. It runs the"
+              echo "audit but cannot authenticate the Anthropic API, so LLM-based false"
+              echo "positive filtering is skipped."
+              exit 1
+            fi
+            if [ -z "$ANTHROPIC_API_KEY" ]; then
+              echo "::warning::Authenticating with CLAUDE_CODE_OAUTH_TOKEN. LLM-based false positive filtering is disabled; set claude-api-key to enable it."
+            fi
+            ;;
+          spark)
+            # The Spark provider talks to vLLM directly: no Claude Code, no Anthropic key.
+            unset ANTHROPIC_API_KEY
+            MISSING=""
+            if [ -z "$VLLM_BASE_URL" ]; then MISSING="$MISSING VLLM_BASE_URL"; fi
+            if [ -z "$VLLM_MODEL" ]; then MISSING="$MISSING VLLM_MODEL"; fi
+            if [ -n "$MISSING" ]; then
+              echo "::error::provider=spark requires:$MISSING"
+              echo "Example usage:"
+              echo "  - uses: mohemian/claude-code-security-review@main"
+              echo "    with:"
+              echo "      provider: spark"
+              echo "    env:"
+              echo "      VLLM_BASE_URL: http://localhost:8000/v1"
+              echo "      VLLM_MODEL: Qwen3-32B"
+              exit 1
+            fi
+            ;;
+          *)
+            echo "::error::Unsupported provider: '$LLM_PROVIDER'. Supported providers: anthropic, spark"
+            exit 1
+            ;;
+        esac
                 
         # Set timeout
         export CLAUDE_TIMEOUT="$CLAUDECODE_TIMEOUT"
@@ -224,8 +312,16 @@ runs:
         echo "::group::ClaudeCode Environment"
         echo "Current directory: $(pwd)"
         echo "Python version: $(python --version)"
-        echo "Claude CLI version: $(claude --version 2>&1 || echo 'Claude CLI not found')"
-        echo "ANTHROPIC_API_KEY set: $(if [ -n "$ANTHROPIC_API_KEY" ]; then echo 'Yes'; else echo 'No'; fi)"
+        echo "Provider: $LLM_PROVIDER"
+        if [ "$LLM_PROVIDER" == "spark" ]; then
+          echo "vLLM base URL: $VLLM_BASE_URL"
+          echo "vLLM model: $VLLM_MODEL"
+          echo "VLLM_API_KEY set: $(if [ -n "$VLLM_API_KEY" ]; then echo 'Yes'; else echo 'No'; fi)"
+        else
+          echo "Claude CLI version: $(claude --version 2>&1 || echo 'Claude CLI not found')"
+          echo "ANTHROPIC_API_KEY set: $(if [ -n "$ANTHROPIC_API_KEY" ]; then echo 'Yes'; else echo 'No'; fi)"
+          echo "CLAUDE_CODE_OAUTH_TOKEN set: $(if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then echo 'Yes'; else echo 'No'; fi)"
+        fi
         echo "GITHUB_REPOSITORY: $GITHUB_REPOSITORY"
         echo "PR_NUMBER: $PR_NUMBER"
         echo "Python path: $PYTHONPATH"
@@ -305,6 +401,63 @@ runs:
         echo "::endgroup::"
     
     
+    - name: Write run summary
+      if: always() && steps.claudecode-check.outputs.enable_claudecode == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        FINDINGS_COUNT: ${{ steps.claudecode-scan.outputs.findings_count }}
+      run: |
+        RESULTS="${{ github.workspace }}/claudecode-results.json"
+        SUMMARY="${{ github.workspace }}/security-review-summary.md"
+
+        # Written to a file first, then appended to the step summary. GITHUB_STEP_SUMMARY
+        # is per-step, so a file is also the only way later steps and the artifact upload
+        # can see what was rendered.
+        {
+          echo "## Security review"
+          echo
+          if [ ! -s "$RESULTS" ]; then
+            echo "The scan produced no results file."
+          elif jq -e '.error' "$RESULTS" >/dev/null 2>&1; then
+            echo "The scan did not complete:"
+            echo
+            echo '```'
+            jq -r '.error' "$RESULTS"
+            echo '```'
+          else
+            jq -r '
+            def n: if . == null then "n/a" else (. | tostring) end;
+            def commas: if . == null then "n/a" else
+              (tostring | explode | reverse | to_entries
+               | map(if .key > 0 and .key % 3 == 0 then [44, .value] else [.value] end)
+               | flatten | reverse | implode) end;
+            def dur: if . == null then "n/a"
+              elif . < 60 then "\(. | round)s"
+              else "\((. / 60 | floor))m \((. % 60 | round))s" end;
+            .run_stats as $s |
+            "| Metric | Value |",
+            "|---|---|",
+            "| Provider | `\($s.provider | n)` |",
+            "| Model | `\($s.model | n)` |",
+            "| Duration (total) | \($s.duration_seconds.total | dur) |",
+            "| — security audit | \($s.duration_seconds.security_audit | dur) |",
+            "| — false-positive filtering | \($s.duration_seconds.false_positive_filtering | dur) |",
+            "| LLM calls | \($s.llm_calls | n) |",
+            "| Input tokens | \($s.input_tokens | commas) |",
+            "| Output tokens | \($s.output_tokens | commas) |",
+            "| Cached input tokens | \($s.cached_input_tokens | commas) |",
+            "| Total tokens | \($s.total_tokens | commas) |",
+            "| Cost | \(if $s.cost_usd == null then "not reported" else "$\($s.cost_usd * 100 | round / 100)" end) |",
+            "| Findings reported by model | \($s.findings.reported_by_model | n) |",
+            "| Findings after filtering | **\($s.findings.kept | n)** |",
+            "| Findings excluded | \($s.findings.excluded | n) |"
+          ' "$RESULTS" 2>/dev/null || echo "Run statistics were not available."
+          fi
+        } > "$SUMMARY"
+
+        cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+        cat "$SUMMARY"
+
     - name: Upload scan results
       if: always() && inputs.upload-results == 'true'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 pinned to commit hash
@@ -314,6 +467,7 @@ runs:
           findings.json
           claudecode-results.json
           claudecode-error.log
+          security-review-summary.md
         retention-days: 7
         if-no-files-found: ignore
     
