@@ -35,10 +35,6 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_MAX_TOKENS = 32768
 PROMPT_TOO_LONG = 'PROMPT_TOO_LONG'
 
-# Retry-on-oversize fallback: how much diff to keep when the model refused the full one.
-# ponytail: flat character budget, not tokens. Swap in a tokenizer if it proves too coarse.
-TRUNCATED_DIFF_CHARS = 60_000
-
 # Caps on model-authored strings that end up in PR comments.
 MAX_FIELD_CHARS = 4000
 MAX_PATH_CHARS = 500
@@ -388,6 +384,7 @@ class SparkProvider:
 
     name = 'spark'
     display_name = 'Spark provider'
+    can_retry_without_diff = False
 
     def __init__(self, client: Optional[VLLMClient] = None):
         self.client = client or VLLMClient.from_env()
@@ -406,20 +403,12 @@ class SparkProvider:
     def build_prompt(self, pr_data, pr_diff, include_diff=True, custom_scan_instructions=None) -> str:
         """Build a tool-free audit prompt.
 
-        `include_diff=False` means the caller is retrying after PROMPT_TOO_LONG. Spark has
-        no way to fetch the code itself, so instead of dropping the diff (which would yield
-        a confident, empty review of nothing) it reviews a truncated diff.
+        Spark has no repository tools, so the full diff is required even if a caller
+        asks to omit it. Context-length failures must fail the review, not drop code.
         """
-        if not include_diff and pr_diff:
-            pr_diff = (
-                pr_diff[:TRUNCATED_DIFF_CHARS]
-                + '\n\n[diff truncated: it exceeded the model context window. '
-                  'Only the portion above is available for review.]'
-            )
-            include_diff = True
         return prompts.get_security_audit_prompt(
             pr_data, pr_diff,
-            include_diff=include_diff,
+            include_diff=True,
             custom_scan_instructions=custom_scan_instructions,
             agentic=False,
         )

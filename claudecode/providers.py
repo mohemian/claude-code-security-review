@@ -38,6 +38,7 @@ class SecurityReviewProvider(Protocol):
     name: str
     display_name: str
     model: str
+    can_retry_without_diff: bool
 
     @property
     def usage(self) -> UsageStats:
@@ -55,7 +56,8 @@ class SecurityReviewProvider(Protocol):
         """Run the audit. Returns (success, error_message, results).
 
         On an over-long prompt the error message must be the sentinel
-        ``"PROMPT_TOO_LONG"`` so the caller can retry with a smaller prompt.
+        ``"PROMPT_TOO_LONG"``. Only providers with repository tools may retry
+        without the diff, as indicated by ``can_retry_without_diff``.
         """
 
     def create_filter_client(self) -> Optional[Any]:
@@ -73,6 +75,7 @@ class AnthropicProvider:
 
     name = 'anthropic'
     display_name = 'Claude Code'
+    can_retry_without_diff = True
 
     def __init__(self, timeout_minutes: Optional[int] = None):
         # Imported here (not at module import time) so `mock.patch` targets in

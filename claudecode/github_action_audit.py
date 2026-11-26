@@ -691,18 +691,18 @@ def main():
         audit_started = time.time()
         success, error_msg, results = provider.run_security_audit(repo_dir, prompt)
         
-        # If prompt is too long, retry with a smaller one
-        if not success and error_msg == "PROMPT_TOO_LONG":
+        # Only a provider with repository tools can review code omitted from the prompt.
+        if not success and error_msg == "PROMPT_TOO_LONG" and provider.can_retry_without_diff:
             print(f"[Info] Prompt too long, retrying with a reduced prompt. Original prompt length: {len(prompt)} characters", file=sys.stderr)
             prompt_without_diff = provider.build_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
             print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
             success, error_msg, results = provider.run_security_audit(repo_dir, prompt_without_diff)
-            if not success and error_msg == "PROMPT_TOO_LONG":
-                error_msg = (
-                    'the PR is too large for the model context window, even after reducing '
-                    'the diff. Exclude directories with `exclude-directories`, or use a '
-                    'model with a larger context window.'
-                )
+        if not success and error_msg == "PROMPT_TOO_LONG":
+            error_msg = (
+                'the PR is too large for the model context window; the review is incomplete. '
+                'Exclude directories with `exclude-directories` to narrow the review scope, '
+                'or use a model with a larger context window. No complete review was produced.'
+            )
         
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))

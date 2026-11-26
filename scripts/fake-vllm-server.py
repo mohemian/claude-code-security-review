@@ -14,7 +14,7 @@ Modes (--mode) let you rehearse the failure paths:
     empty      valid report, no findings
     malformed  a finding with a bogus severity -- the run must fail, not drop it
     prose      no JSON at all -- parse error
-    toolong    HTTP 400 context-length -- must trigger the truncated-diff retry
+    toolong    HTTP 400 context-length -- must report an incomplete review
     flaky      HTTP 500 on the first call, then valid -- must retry
 """
 

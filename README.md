@@ -139,6 +139,11 @@ The default budget is therefore `32768`, and a truncated response is always repo
 error rather than parsed as a partial report. If you see one, either raise
 `VLLM_MAX_TOKENS` or set `VLLM_ENABLE_THINKING=false`.
 
+Spark also requires the full diff to fit in the model's input context window. If the
+server rejects it as too large, the review reports an incomplete-review error in the
+results and Action summary. Use a larger context window or explicitly narrow the review
+scope with `exclude-directories`.
+
 > Whether reasoning improves finding quality enough to pay for is a benchmarking question,
 > not a settled one. The knob is there so you can measure it.
 
@@ -376,7 +381,7 @@ Then run the dry-run command above against `http://localhost:8000/v1`. Expected 
 | `empty` | exit 0, no findings |
 | `malformed` | exit 1, `Invalid security report from model: findings[0] has severity ...` |
 | `prose` | exit 1, `Could not parse JSON from vLLM response` |
-| `toolong` | two audit calls, then an error telling you to exclude directories |
+| `toolong` | one audit call, then an incomplete-review error; use a larger context window or narrow the review scope with `exclude-directories` |
 | `flaky` | HTTP 500 retried, then a normal result |
 
 ### Positive control

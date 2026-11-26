@@ -238,14 +238,19 @@ class TestProviderPrompts:
             assert '"findings"' in prompt
             assert '"exploit_scenario"' in prompt
 
-    def test_spark_truncates_rather_than_dropping_the_diff(self):
-        """include_diff=False is the too-long retry; Spark cannot fetch code itself."""
-        big_diff = 'x' * 200_000
+    def test_spark_keeps_the_full_diff_even_when_omission_is_requested(self):
+        """Spark cannot fetch omitted code, including files at the end of a large PR."""
+        big_diff = 'x' * 200_000 + '\ndiff --git a/last.py b/last.py\n+tail_marker'
         with patch.dict(os.environ, SPARK_ENV):
             prompt = create_provider('spark').build_prompt(self.pr_data, big_diff, include_diff=False)
-        assert 'diff truncated' in prompt
-        assert len(prompt) < len(big_diff)
-        assert 'x' * 1000 in prompt
+        assert big_diff in prompt
+        assert 'tail_marker' in prompt
+        assert 'diff truncated' not in prompt
+
+    def test_only_the_agentic_provider_can_retry_without_a_diff(self):
+        assert create_provider('anthropic').can_retry_without_diff is True
+        with patch.dict(os.environ, SPARK_ENV):
+            assert create_provider('spark').can_retry_without_diff is False
 
 
 class TestProviderProtocolSurface:
@@ -255,13 +260,13 @@ class TestProviderProtocolSurface:
     def test_surface(self, name):
         with patch.dict(os.environ, SPARK_ENV):
             provider = create_provider(name)
-        for attribute in ('name', 'display_name', 'validate', 'build_prompt',
+        for attribute in ('name', 'display_name', 'can_retry_without_diff', 'validate', 'build_prompt',
                           'run_security_audit', 'create_filter_client'):
             assert hasattr(provider, attribute), f'{name} is missing {attribute}'
 
 
 class TestPromptTooLongRetry:
-    """main()'s too-long retry must give Spark a smaller diff, not no diff at all."""
+    """Oversized Spark reviews fail instead of claiming coverage of a partial diff."""
 
     pr_data = {
         'number': 9, 'title': 'Big change', 'body': '', 'user': 'bob', 'changed_files': 1,
@@ -269,7 +274,7 @@ class TestPromptTooLongRetry:
         'head': {'repo': {'full_name': 'o/r'}},
     }
 
-    def test_retry_reviews_a_truncated_diff(self, capsys):
+    def test_context_length_failure_cannot_become_a_successful_empty_review(self, capsys):
         from claudecode import github_action_audit as gaa
 
         prompts_sent = []
@@ -300,14 +305,15 @@ class TestPromptTooLongRetry:
             with pytest.raises(SystemExit) as exc_info:
                 gaa.main()
 
-        assert exc_info.value.code == 0
-        assert len(prompts_sent) == 2, 'the too-long response should trigger exactly one retry'
-        assert 'diff truncated' in prompts_sent[1]
-        assert len(prompts_sent[1]) < len(prompts_sent[0])
-        # The retry must still contain code to review, not just a "diff omitted" note.
-        assert 'x' * 10_000 in prompts_sent[1]
+        assert exc_info.value.code != 0
+        assert len(prompts_sent) == 1, 'a successful partial retry would falsely claim coverage'
+        output = json.loads(capsys.readouterr().out)
+        assert 'review is incomplete' in output['error']
+        assert 'analysis_summary' not in output
+        assert 'findings' not in output
+        assert 'run_stats' not in output
 
-    def test_still_too_long_after_retry_gives_a_human_error(self, capsys):
+    def test_prompt_too_long_gives_a_human_error(self, capsys):
         from claudecode import github_action_audit as gaa
 
         def always_too_long(url, **kwargs):
@@ -331,6 +337,31 @@ class TestPromptTooLongRetry:
         assert 'PROMPT_TOO_LONG' not in error, 'internal sentinel leaked to the user'
         assert 'too large for the model context window' in error
         assert 'exclude-directories' in error
+
+    def test_anthropic_still_retries_with_repository_tools(self, capsys):
+        from claudecode import github_action_audit as gaa
+
+        with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'o/r', 'PR_NUMBER': '9',
+                                     'GITHUB_TOKEN': 'gh-token'}, clear=True), \
+                patch.object(gaa, 'GitHubActionClient') as mock_github, \
+                patch.object(gaa.SimpleClaudeRunner, 'validate_claude_available',
+                             return_value=(True, '')), \
+                patch.object(gaa.SimpleClaudeRunner, 'run_security_audit', side_effect=[
+                    (False, 'PROMPT_TOO_LONG', {}),
+                    (True, '', {'findings': [], 'analysis_summary': {'review_completed': True}}),
+                ]) as mock_audit:
+            client = Mock()
+            client.get_pr_data.return_value = self.pr_data
+            client.get_pr_diff.return_value = 'unique-diff-marker'
+            mock_github.return_value = client
+            with pytest.raises(SystemExit) as exc_info:
+                gaa.main()
+
+        assert exc_info.value.code == 0
+        assert mock_audit.call_count == 2
+        assert 'unique-diff-marker' in mock_audit.call_args_list[0].args[1]
+        assert 'unique-diff-marker' not in mock_audit.call_args_list[1].args[1]
+        assert json.loads(capsys.readouterr().out)['analysis_summary']['review_completed'] is True
 
 
 class TestClaudeCodeOAuthToken:
