@@ -1,0 +1,193 @@
+"""Prompt construction for per-finding false-positive filtering.
+
+Provider-agnostic: the filtering step is a single stateless completion, so every
+provider reuses these prompts verbatim. Kept out of claude_api_client.py so that
+non-Anthropic providers never import the Anthropic SDK.
+"""
+
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+from claudecode.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+def generate_system_prompt() -> str:
+    """Generate system prompt for security analysis."""
+    return """You are a security expert reviewing findings from an automated code audit tool.
+Your task is to filter out false positives and low-signal findings to reduce alert fatigue.
+You must maintain high recall (don't miss real vulnerabilities) while improving precision.
+
+Respond ONLY with valid JSON in the exact format specified in the user prompt.
+Do not include explanatory text, markdown formatting, or code blocks."""
+
+def generate_single_finding_prompt(finding: Dict[str, Any],
+                               pr_context: Optional[Dict[str, Any]] = None,
+                               custom_filtering_instructions: Optional[str] = None) -> str:
+    """Generate prompt for analyzing a single security finding.
+    
+    Args:
+        finding: Single security finding
+        pr_context: Optional PR context
+        
+    Returns:
+        Formatted prompt string
+    """
+    pr_info = ""
+    if pr_context and isinstance(pr_context, dict):
+        pr_info = f"""
+PR Context:
+- Repository: {pr_context.get('repo_name', 'unknown')}
+- PR #{pr_context.get('pr_number', 'unknown')}
+- Title: {pr_context.get('title', 'unknown')}
+- Description: {(pr_context.get('description') or 'No description')[:500]}...
+"""
+    
+    # Get file content if available
+    file_path = finding.get('file', '')
+    file_content = ""
+    if file_path:
+        success, content, error = read_repo_file(file_path)
+        if success:
+            file_content = f"""
+
+File Content ({file_path}):
+```
+{content}
+```"""
+        else:
+            file_content = f"""
+
+File Content ({file_path}): Error reading file - {error}
+"""
+    
+    finding_json = json.dumps(finding, indent=2)
+    
+    # Use custom filtering instructions if provided, otherwise use defaults
+    if custom_filtering_instructions:
+        filtering_section = custom_filtering_instructions
+    else:
+        filtering_section = """HARD EXCLUSIONS - Automatically exclude findings matching these patterns:
+1. Denial of Service (DOS) vulnerabilities or resource exhaustion attacks
+2. Secrets/credentials stored on disk (these are managed separately) 
+3. Rate limiting concerns or service overload scenarios (services don't need to implement rate limiting)
+4. Memory consumption or CPU exhaustion issues
+5. Lack of input validation on non-security-critical fields without proven security impact
+6. Input sanitization concerns for github action workflows
+7. A lack of hardening measures. Code is not expected to implement all security best practices, just avoid obvious vulnerabilities.
+8. Race conditions or timing attacks that are theoretical rather than practical issues. Only report a race condition if it is extremely problematic.
+9. Vulnerabilities related to outdated third-party libraries. These are managed separately and should not be reported here.
+10. Memory safety issues such as buffer overflows or use-after-free-vulnerabilities are impossible in rust. Do not report memory safety issues in rust code.
+11. Files that are only unit tests or only used as part of running tests.
+12. Log spoofing concerns. Outputing un-sanitized user input to logs is not a vulnerability.
+13. SSRF vulnerabilities that only control the path. SSRF is only a concern if it can control the host or protocol.
+14. Including user-controlled content in AI system prompts is not a vulnerability. In general, the inclusion of user input in an AI prompt is not a vulnerability.
+15. Do not report issues related to adding a dependency to a project that is not available from the relevant package repository. Depending on internal libraries that are not publicly available is not a vulnerability.
+16. Do not report issues that cause the code to crash, but are not actually a vulnerability. E.g. a variable that is undefined or null is not a vulnerability.
+
+SIGNAL QUALITY CRITERIA - For remaining findings, assess:
+1. Is there a concrete, exploitable vulnerability with a clear attack path?
+2. Does this represent a real security risk vs theoretical best practice?
+3. Are there specific code locations and reproduction steps?
+4. Would this finding be actionable for a security team?
+
+PRECEDENTS - 
+1. Logging high value secrets in plaintext is a vulnerability. Otherwise, do not report issues around theoretical exposures of secrets. Logging URLs is assumed to be safe. Logging request headers is assumed to be dangerous since they likely contain credentials.
+2. UUIDs can be assumed to be unguessable and do not need to be validated. If a vulnerabilities requires guessing a UUID, it is not a valid vulnerability.
+3. Audit logs are not a critical security feature and should not be reported as a vulnerability if they are missing or modified.
+4. Environment variables and CLI flags are trusted values. Attackers are not able to modify them in a secure environment. Any attack that relies on controlling an environment variable is invalid.
+5. Resource management issues such as memory or file descriptor leaks are not valid.
+6. Subtle or low impact web vulnerabilities such as tabnabbing, XS-Leaks, prototype pollution, and open redirects are not valid.
+7. Vulnerabilities related to outdated third-party libraries. These are managed separately and should not be reported here.
+8. React is generally secure against XSS. React does not need to sanitize or escape user input unless it is using dangerouslySetInnerHTML or similar methods. Do not report XSS vulnerabilities in React components or tsx files unless they are using unsafe methods.
+9. Most vulnerabilities in github action workflows are not exploitable in practice. Before validating a github action workflow vulnerability ensure it is concrete and has a very specific attack path.
+10. A lack of permission checking or authentication in client-side TS code is not a vulnerability. Client-side code is not trusted and does not need to implement these checks, they are handled on the server-side. The same applies to all flows that send untrusted data to the backend, the backend is responsible for validating and sanitizing all inputs.
+11. Only include MEDIUM findings if they are obvious and concrete issues.
+12. Most vulnerabilities in ipython notebooks (*.ipynb files) are not exploitable in practice. Before validating a notebook vulnerability ensure it is concrete and has a very specific attack path.
+13. Logging non-PII data is not a vulnerability even if the data may be sensitive. Only report logging vulnerabilities if they expose sensitive information such as secrets, passwords, or personally identifiable information (PII).
+14. Command injection vulnerabilities in shell scripts are generally not exploitable in practice since shell scripts generally do not run with untrusted user input. Only report command injection vulnerabilities in shell scripts if they are concrete and have a very specific attack path for untrusted input.
+15. SSRF (Server-Side Request Forgery) vulnerabilities in client-side JavaScript/TypeScript files (.js, .ts, .tsx, .jsx) are not valid since client-side code cannot make server-side requests that would bypass firewalls or access internal resources. Only report SSRF in server-side code (e.g. Python or JS that is known to run on the server-side). The same logic applies to path-traversal attacks, they are not a problem in client-side JS.
+16. Path traversal attacks using ../ are generally not a problem when triggering HTTP requests. These are generally only relevant when reading files where the ../ may allow accessing unintended files.
+17. Injecting into log queries is generally not an issue. Only report this if the injection will definitely lead to exposing sensitive data to external users."""
+    
+    return f"""I need you to analyze a security finding from an automated code audit and determine if it's a false positive.
+
+{pr_info}
+
+{filtering_section}
+
+Assign a confidence score from 1-10:
+- 1-3: Low confidence, likely false positive or noise
+- 4-6: Medium confidence, needs investigation  
+- 7-10: High confidence, likely true vulnerability
+
+Finding to analyze:
+```json
+{finding_json}
+```
+{file_content}
+
+Respond with EXACTLY this JSON structure (no markdown, no code blocks):
+{{
+  "original_severity": "HIGH",
+  "confidence_score": 8,
+  "keep_finding": true,
+  "exclusion_reason": null,
+  "justification": "Clear SQL injection vulnerability with specific exploit path"
+}}"""
+
+
+def read_repo_file(file_path: str) -> Tuple[bool, str, str]:
+    """Read a file and format it with line numbers.
+    
+    Args:
+        file_path: Path to the file to read
+        
+    Returns:
+        Tuple of (success, formatted_content, error_message)
+    """
+    try:
+        # Check if REPO_PATH is set and use it as base path
+        repo_path = os.environ.get('REPO_PATH')
+        if repo_path:
+            # Convert file_path to Path and check if it's absolute
+            path = Path(file_path)
+            if not path.is_absolute():
+                # Make it relative to REPO_PATH
+                path = Path(repo_path) / file_path
+        else:
+            path = Path(file_path)
+
+        # `file_path` comes from model output, which repository content can influence via
+        # prompt injection. Keep reads inside the repository so a crafted finding cannot
+        # pull runner credentials into the filtering prompt.
+        if repo_path:
+            root = Path(repo_path).resolve()
+            resolved = path.resolve()
+            if resolved != root and root not in resolved.parents:
+                return False, "", f"Refusing to read outside the repository: {file_path}"
+
+        if not path.exists():
+            return False, "", f"File not found: {path}"
+        
+        if not path.is_file():
+            return False, "", f"Path is not a file: {path}"
+        
+        # Read file with error handling for encoding issues
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            # Try with latin-1 encoding as fallback
+            with open(path, 'r', encoding='latin-1') as f:
+                content = f.read()
+        
+        return True, content, ""
+        
+    except Exception as e:
+        error_msg = f"Error reading file {file_path}: {str(e)}"
+        logger.error(error_msg)
+        return False, "", error_msg

@@ -67,10 +67,11 @@ class TestHelperFunctions:
         mock_github_client.return_value = mock_github_instance
         mock_claude_runner.return_value = mock_claude_instance
         
-        github_client, claude_runner = initialize_clients()
+        github_client, provider = initialize_clients()
         
         assert github_client == mock_github_instance
-        assert claude_runner == mock_claude_instance
+        assert provider.name == 'anthropic'
+        assert provider.runner == mock_claude_instance
         mock_github_client.assert_called_once()
         mock_claude_runner.assert_called_once()
     

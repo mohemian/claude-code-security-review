@@ -13,10 +13,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    env:
+      # The `secrets` context is not available in a job-level `if`, so mirror it into env.
+      CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 pinned to commit hash
 
       - uses: ./ # Points directly to action.yml
+        if: env.CLAUDE_API_KEY != ''
         with:
           comment-pr: true
           upload-results: true
